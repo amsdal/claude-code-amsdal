@@ -1,0 +1,21 @@
+{
+  "name": "amsdal",
+  "version": "0.1.0",
+  "description": "AMSDAL Framework knowledge plugin — models, server, ETL, deployment, testing, and plugins",
+  "skills": [
+    "./skills/amsdal-overview",
+    "./skills/amsdal-models",
+    "./skills/amsdal-server",
+    "./skills/amsdal-glue",
+    "./skills/amsdal-deploy",
+    "./skills/amsdal-testing",
+    "./skills/amsdal-plugins",
+    "./skills/amsdal-ml",
+    "./skills/amsdal-ecosystem",
+    "./skills/amsdal-frontend-configs",
+    "./skills/amsdal-workspace"
+  ],
+  "agents": [
+    "./agents/amsdal-expert.md"
+  ]
+}
