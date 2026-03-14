@@ -15,13 +15,16 @@ Claude Code plugin that gives Claude full knowledge of the AMSDAL framework: mod
 git clone git@github.com:amsdal/claude-code-amsdal.git ~/claude-code-amsdal
 ```
 
-### 2. Install the plugin globally
+### 2. Install the plugin
 
-This makes the plugin available in **every** Claude Code session, regardless of which project you're in:
+Add it as a local marketplace and install:
 
 ```bash
-claude plugins add ~/claude-code-amsdal
+claude plugin marketplace add ~/claude-code-amsdal
+claude plugin install amsdal@amsdal-plugins
 ```
+
+This makes the plugin available in every Claude Code session (CLI and Desktop Code tab).
 
 ### 3. Set up AMSDAL source workspace (recommended)
 
@@ -46,17 +49,15 @@ Claude should know the answer without any extra context.
 
 ## Alternative Installation Methods
 
-### Per-project only
+### Per-project scope
 
-If you only want the plugin in a specific project, add to `.claude/settings.json` in that project:
+Install for a specific project only (writes to `.claude/settings.json`):
 
-```json
-{
-  "plugins": ["~/claude-code-amsdal"]
-}
+```bash
+claude plugin install amsdal@amsdal-plugins --scope project
 ```
 
-### One-time session
+### One-time session (for development/testing)
 
 ```bash
 claude --plugin-dir ~/claude-code-amsdal

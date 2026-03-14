@@ -1,0 +1,18 @@
+{
+  "name": "amsdal-plugins",
+  "owner": {
+    "name": "AMSDAL",
+    "email": "support@amsdal.com"
+  },
+  "metadata": {
+    "description": "AMSDAL Framework knowledge plugins for Claude Code",
+    "version": "1.0.0"
+  },
+  "plugins": [
+    {
+      "name": "amsdal",
+      "description": "AMSDAL Framework knowledge plugin — models, server, ETL, deployment, testing, and plugins",
+      "source": "./"
+    }
+  ]
+}
