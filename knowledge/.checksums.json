@@ -1,0 +1,19 @@
+{
+  "amsdal/fixtures/manager.py": "6bbff8df07629f997174c37c5727c01b1f8dd9fa40e48337f5e46400278ce173",
+  "amsdal/fixtures/utils.py": "5e4e94ab9c08e4de7dafc2276f1c87d5ae4d9124babbbe684a65d5777b6c8f04",
+  "amsdal/manager.py": "e440f0daa9d386ee76048bc3faad98844ceba3d88bb4e63f353f6ef2bcb09bd8",
+  "amsdal/mixins/class_versions_mixin.py": "505fef4aef5d6b17df58e9b7c95a38e39b0ddb147159e5219f3d6754c4269a09",
+  "amsdal/services/transaction_execution.py": "4b06a65c815f8d5e9137cae28b41f015831d12b97f390e77dc8a8881610a4ced",
+  "amsdal_data/lock/implementations/redis_lock.py": "d83793006cbe4f549de70482b9b09a53830adddd183f2ebcd500306c4b9db132",
+  "amsdal_data/lock/implementations/thread_lock.py": "1ad1398ca95702f1d512b350a43de92e75a1145e442c95d8a0e548b1219769ca",
+  "amsdal_data/transactions/manager.py": "e507c0fb93272d63edd8eeb3684a04beb0811c73f1f58b37a1348252999385f4",
+  "amsdal_models/classes/constants.py": "4434154c1db4eb1d28705f32545c52f59bd62f9d1fdfeb432cb573a6050c8824",
+  "amsdal_models/classes/enums.py": "8847a5e08a4c65eb29745d6520dfd5ce308c20c06b3dd10282f2bd1eb3a5e9d4",
+  "amsdal_models/classes/helpers/reference_loader.py": "c15333d4b189dd5fcf28d908d816990532945612fc9cb5b1d4530878cfe04697",
+  "amsdal_models/classes/utils.py": "3f98da82d1a81cedcc8db6e687e3db1ce30053dd17ab953c3591485aafbef3c1",
+  "amsdal_models/querysets/base_queryset.py": "506c67bab171f3341672e844bb14952a8b18a71ef2d0cd5691629fff163c5c8c",
+  "amsdal_models/utils/__init__.py": "28ab3bd6e2cd56af6e2bca847c14d7dff5dcb48b8fff44fec93fc6d341d52987",
+  "amsdal_models/utils/files.py": "09cf9c9e1531fa231324d6c6dd3e1721d059265e42501fb1a3391698067c4f3d",
+  "amsdal_models/utils/schema_converter.py": "f47eb28d3599ece1a1052940c1def6d4c8391ac9abb4ebeef9972e46bea61a1b",
+  "amsdal_models/utils/specific_version.py": "020cc71f784d602d59bcb49edf2d3e1ab19fb0413b60e21d4da5ed442356e719"
+}

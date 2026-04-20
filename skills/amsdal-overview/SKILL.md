@@ -479,18 +479,3 @@ These are critical rules that prevent broken code:
 11. **Database driver packages must be in `requirements.txt`** — `amsdal` does not bundle DB drivers. Async SQLite needs `amsdal-glue-connections[async-sqlite]`, PostgreSQL needs `amsdal-glue-connections[postgres-binary]` (or `postgres-c` for production). Without these, you get `ImportError: "aiosqlite" package is required` or similar.
 12. **Never set `AMSDAL_REQUIRE_DEFAULT_AUTHORIZATION=False` when auth is needed** — this makes everything public by default, defeating the purpose of auth. Use `True` and selectively open public endpoints with `@permissions(read=AllowAny)` or `@allow_any`.
 13. **Never remove default contribs from `AMSDAL_CONTRIBS`** — `AMSDAL_CONTRIBS` replaces the default list (it does not append). Always include both `AuthAppConfig` and `FrontendConfigAppConfig`. Dropping `FrontendConfigAppConfig` breaks the AMSDAL Console frontend.
-
----
-
-## Source Code Access
-
-If you need to check the latest API or source code of AMSDAL packages, look for local clones in the workspace directory. Set `AMSDAL_WORKSPACE` environment variable to the root directory containing all AMSDAL repositories.
-
-Expected repo layout under `$AMSDAL_WORKSPACE`:
-```
-amsdal_framework/    amsdal_models/    amsdal_data/
-amsdal_server/       amsdal_utils/     amsdal-glue/
-amsdal_cli/          amsdal_ml/        amsdal_mail/
-amsdal_storages/     amsdal_langgraph/ amsdal_integrations/
-amsdal_crm/
-```

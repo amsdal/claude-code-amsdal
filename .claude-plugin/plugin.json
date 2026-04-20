@@ -12,8 +12,7 @@
     "./skills/amsdal-plugins",
     "./skills/amsdal-ml",
     "./skills/amsdal-ecosystem",
-    "./skills/amsdal-frontend-configs",
-    "./skills/amsdal-workspace"
+    "./skills/amsdal-frontend-configs"
   ],
   "agents": [
     "./agents/amsdal-expert.md"

@@ -5,7 +5,8 @@ Claude Code plugin that gives Claude full knowledge of the AMSDAL framework: mod
 ## Prerequisites
 
 - [Claude Code](https://docs.anthropic.com/en/docs/claude-code) installed and working
-- Git + SSH access to AMSDAL repositories (for source code access)
+
+That's it. The plugin is fully self-contained.
 
 ## Quick Start
 
@@ -26,20 +27,7 @@ claude plugin install amsdal@amsdal-plugins
 
 This makes the plugin available in every Claude Code session (CLI and Desktop Code tab).
 
-### 3. Set up AMSDAL source workspace (recommended)
-
-Start Claude Code and run the built-in command:
-
-```
-/amsdal:amsdal-workspace
-```
-
-This will:
-- Clone all AMSDAL repos as git submodules into one directory
-- Set `AMSDAL_WORKSPACE` in your shell profile permanently
-- Run it again later to pull the latest changes for all repos
-
-### 4. Verify
+### 3. Verify
 
 Start Claude Code in any directory and ask something like:
 
@@ -87,61 +75,63 @@ Skills are contextual knowledge packs that Claude loads automatically based on w
 
 | Command | What it does |
 |---------|-------------|
-| `/amsdal:amsdal-workspace` | Clone or update all AMSDAL source repositories |
 | `/amsdal:amsdal-deploy` | CLI reference, cloud deployment, monitoring |
 
-### Agent
+### Agent: `amsdal-expert`
 
-| Agent | What it does |
-|-------|-------------|
-| `amsdal-expert` | Deep research agent that reads actual AMSDAL source code. Use for questions like "what does X method actually do?" |
+Deep research agent for questions that require understanding internal behavior — e.g. "why does `QuerySet.get()` return a LegacyModel?", "what does `AmsdalTransactionManager.commit` do on failure?", traceback analysis.
 
-## Source Code Access
+The agent cross-references three sources:
 
-The `amsdal-expert` agent searches through locally cloned AMSDAL repos. This is useful because:
+1. **Knowledge base** (bundled with this plugin) — behavioral descriptions of Cython-compiled modules.
+2. **`.pyi` stubs** (from your installed AMSDAL packages) — exact API signatures.
+3. **Source code** of pure-Python packages (from your venv's `site-packages`) — `amsdal_server`, `amsdal-glue`, `amsdal_cli`, etc.
 
-- Documentation can be outdated, source code is always current
-- Tests show real usage patterns
-- You can check actual API signatures
+## Knowledge Base
 
-### Setup with command (recommended)
+Core AMSDAL packages (`amsdal`, `amsdal_models`, `amsdal_data`) are compiled via Cython — you only have `.so` binaries and `.pyi` stubs, not Python source. This makes debugging harder because internal behavior isn't visible.
+
+To bridge this gap, the plugin includes a `knowledge/` directory with **behavioral documentation** for every Cython-compiled module. Each file describes step-by-step what the code does internally, edge cases, error conditions, and side effects.
+
+### Structure
+
+The directory mirrors the package layout 1:1:
 
 ```
-/amsdal:amsdal-workspace
+knowledge/
+├── amsdal/                              # amsdal_framework internals
+│   ├── fixtures/manager.md
+│   ├── manager.md
+│   ├── services/transaction_execution.md
+│   └── ...
+├── amsdal_models/
+│   ├── classes/
+│   │   ├── constants.md
+│   │   ├── enums.md
+│   │   ├── helpers/reference_loader.md
+│   │   └── utils.md
+│   ├── querysets/base_queryset.md
+│   └── utils/
+│       ├── files.md
+│       ├── schema_converter.md
+│       └── specific_version.md
+└── amsdal_data/
+    ├── lock/implementations/
+    │   ├── redis_lock.md
+    │   └── thread_lock.md
+    └── transactions/manager.md
 ```
 
-### Manual setup
+### How the agent uses it
 
-If you already have repos cloned, just set the env var. Add to your shell profile:
-
-**zsh** (`~/.zshrc`):
-```bash
-export AMSDAL_WORKSPACE=/path/to/your/amsdal_repos
+When you share a traceback like:
+```
+amsdal_data.transactions.manager.AmsdalTransactionManager.commit
 ```
 
-**bash on macOS** (`~/.bash_profile`):
-```bash
-export AMSDAL_WORKSPACE=/path/to/your/amsdal_repos
-```
+The agent finds `knowledge/amsdal_data/transactions/manager.md`, reads the behavioral description of `commit()`, and explains what happens inside — including the order of operations, when `REVERT` is issued, and which errors are raised.
 
-**bash on Linux/WSL** (`~/.bashrc`):
-```bash
-export AMSDAL_WORKSPACE=/path/to/your/amsdal_repos
-```
-
-**fish**:
-```bash
-set -Ux AMSDAL_WORKSPACE /path/to/your/amsdal_repos
-```
-
-Expected layout under `$AMSDAL_WORKSPACE`:
-```
-amsdal_framework/    amsdal_models/    amsdal_data/
-amsdal_server/       amsdal_utils/     amsdal-glue/
-amsdal_cli/          amsdal_ml/        amsdal_crm/
-amsdal_mail/         amsdal_storages/  amsdal_langgraph/
-amsdal_integrations/
-```
+The knowledge base is kept up-to-date with AMSDAL releases.
 
 ## What Can Claude Do With This Plugin?
 
@@ -154,3 +144,4 @@ amsdal_integrations/
 - **Write tests** following AMSDAL patterns
 - **Create custom plugins** with events, routes, middleware
 - **Help with deployment** — CLI commands, cloud, monitoring
+- **Debug production issues** — trace through internal behavior of Cython-compiled modules via the bundled knowledge base
