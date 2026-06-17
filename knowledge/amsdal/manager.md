@@ -1,294 +1,282 @@
-# `amsdal.manager` Module Documentation
+# Module `amsdal.manager`
 
-This module defines two singleton manager classes that orchestrate the entire AMSDAL framework lifecycle: `AmsdalManager` (sync) and `AsyncAmsdalManager` (async). Both share near-identical behavior but differ in whether setup/teardown/fixture application are synchronous or awaitable.
+Central lifecycle orchestrators for the AMSDAL framework. Defines two singleton manager classes — `AmsdalManager` (synchronous) and `AsyncAmsdalManager` (asynchronous). Each reads configuration, installs per-layer contexts (data / models / framework), eager-imports and resolves all registered model classes, connects the data layer, registers internal classes/tables, applies fixtures, performs license authentication, and tears everything down on exit.
 
-Both classes inherit from `ClassVersionsMixin` and use the `Singleton` metaclass, meaning instantiating them multiple times returns the same instance until `.invalidate()` is called on the class.
+Both classes are near-identical mirror images; the async one differs only in `async`/`await` on `connect_data`, `setup`, `post_setup`, `apply_fixtures`, `teardown`, uses async data-layer component classes, and registers the async metadata query / async fixtures manager. Differences are noted explicitly per method.
+
+## Module-level imports and their roles
+
+- `sys`, `import_module` (from `importlib`), `Path` (from `pathlib`) — stdlib.
+- `AsyncDataApplication`, `DataApplication` (`amsdal_data.application`) — data layer application objects.
+- `AsyncMetadataInfoQuery`, `MetadataInfoQuery` (`amsdal_data.query`) — metadata query implementations registered into the metadata manager.
+- `async_transaction`, `transaction` (`amsdal_data.transactions.decorators`) — decorators wrapping methods in a (async) transaction.
+- `ReferenceLoader` (`amsdal_models.classes.helpers.reference_loader`) — concrete reference loader registered into `ReferenceLoaderManager`.
+- `get_class_manager` (`amsdal_models.contexts`) — returns the current models-context class manager.
+- `MetadataInfoManager` (`amsdal_utils.classes.metadata_manager`) — manager for metadata info queries; has class method `invalidate()`.
+- `AmsdalConfig` (`amsdal_utils.config.data_models.amsdal_config`) — config data model.
+- `AmsdalConfigManager` (`amsdal_utils.config.manager`) — config manager; `get_config()` may raise `AttributeError` if no config set; has class method `invalidate()`.
+- `ReferenceLoaderManager` (`amsdal_utils.models.data_models.reference`) — has instance method `set_reference_loader(...)` and class method `invalidate()`.
+- `ModuleType` (`amsdal_utils.models.enums`) — enum with members `CORE`, `TYPE`, `CONTRIB`, `USER` (and others) used to tag model modules.
+- `Singleton` (`amsdal_utils.utils.singleton`) — metaclass (see below).
+- `CloudActionsManager` (`amsdal.cloud.services.actions.manager`).
+- `settings` (`amsdal.configs.main`) — settings object; attributes used: `CONTRIBS`, `USER_MODELS_MODULE`, `user_models_path`, `fixtures_root_path`, `STRICT_BOOTSTRAP`.
+- `AmsdalAuthenticationError`, `AmsdalRuntimeError` (`amsdal.errors`).
+- `AsyncFixturesManager`, `FixturesManager` (`amsdal.fixtures.manager`).
+- `ClassVersionsMixin` (`amsdal.mixins.class_versions_mixin`) — base mixin (see below).
+
+### `Singleton` metaclass behavior (from `amsdal_utils.utils.singleton`)
+
+`Singleton(type, Generic[T])` keeps a class-level dict `__instances: dict[type, instance]`.
+- `__call__(cls, *args, **kwargs)`: if `cls not in __instances`, creates the instance via `super().__call__(...)` and stores it; always returns the stored instance. Thus `AmsdalManager()` / `AsyncAmsdalManager()` return the same object every time until invalidated.
+- `invalidate(cls)`: if `cls is Singleton` clears ALL instances; elif `cls in __instances` deletes only that class's instance. `self.__class__.invalidate()` in `teardown` drops the cached singleton so the next construction re-runs `__init__`.
+
+### `ClassVersionsMixin` behavior (from `amsdal.mixins.class_versions_mixin`)
+
+Provides registration of AMSDAL internal classes.
+- `_register_internal_classes(schema_version_manager)` (staticmethod): loops over the exact tuple of class names `('Object', 'Transaction', 'Metadata', 'Reference', 'Migration')` and calls `schema_version_manager.register_last_version(internal_class, '')` for each (second arg is the empty string `''`, i.e. version key).
+- `register_internal_classes()` (classmethod): calls `_register_internal_classes(get_historical_schema_version_manager())` (`get_historical_schema_version_manager` imported from `amsdal_data.contexts`).
+- `aregister_internal_classes()` (async classmethod): same body — calls `_register_internal_classes(get_historical_schema_version_manager())`; it is `async` only to fit the async call site (it does not actually await anything internally).
 
 ---
 
 ## `AmsdalManager`
 
-Top-level orchestrator for the synchronous AMSDAL framework. Holds references to sub-managers (config, data application, class manager, auth manager, metadata manager) and drives the initialization → setup → post-setup → teardown lifecycle.
+`class AmsdalManager(ClassVersionsMixin, metaclass=Singleton)`
 
-### State (instance attributes)
+Synchronous orchestrator of the whole framework. Singleton: only one instance exists per process until `teardown()` (or explicit `invalidate()`).
 
-All attributes are set during `__init__`:
+### State (instance attributes set in `__init__`)
 
-- `_config_manager: AmsdalConfigManager` — singleton config manager obtained via `AmsdalConfigManager()`.
-- `_config: AmsdalConfig` — result of `self._config_manager.get_config()`. If missing, `__init__` raises `AmsdalRuntimeError` (see below).
-- `_data_application: DataApplication` — fresh `DataApplication()` instance. Not yet set up — `.setup(config)` is called later in `setup()`.
-- `_is_setup: bool` — defaults to `False`. Flipped to `True` at the end of `setup()`, back to `False` at the end of `teardown()`.
-- `__is_authenticated: bool` — name-mangled to `_AmsdalManager__is_authenticated`. Defaults to `False`. Set to `True` only after successful `authenticate()`.
-- `_metadata_manager: MetadataInfoManager` — singleton. Immediately has `MetadataInfoQuery` registered via `register_metadata_info_query(MetadataInfoQuery)`.
-- `_class_manager: ClassManager` — singleton. Used later by `pre_setup()` to register model modules.
-- `_auth_manager: AuthManager` — imported lazily inside `__init__` from `amsdal.cloud.services.auth.manager`. May be constructed twice if a signup flow occurs (see below).
+- `_config_manager: AmsdalConfigManager` — a freshly constructed `AmsdalConfigManager()`.
+- `_config: AmsdalConfig` — result of `_config_manager.get_config()`.
+- `_data_application: DataApplication` — freshly constructed `DataApplication()`.
+- `_is_setup: bool` — initial value `False`. Set `True` at end of `setup()`, `False` in `teardown()`. Exposed read-only via `is_setup`.
+- `__is_authenticated: bool` — name-mangled to `_AmsdalManager__is_authenticated`. Initial value `False`. Set `True` by `authenticate()`. Exposed read-only via `is_authenticated`.
+- `_metadata_manager: MetadataInfoManager` — freshly constructed `MetadataInfoManager()`; has `MetadataInfoQuery` registered into it.
+- `_frozen: bool` — initial value `False`. Set `True` at end of `_freeze()`; reset to `False` at the start of `teardown()`. Acts as the K1-invariant flag (no method in this module reads it as a guard — informational).
+- `_default_data_context: object | None` — initial `None`; populated by `_install_layer_contexts()` with an `AmsdalDataContext()`; reset to `None` during `teardown()`.
+- `_default_models_context: object | None` — initial `None`; populated with an `AmsdalModelsContext(...)`; reset to `None` during `teardown()`.
+- `_default_framework_context: object | None` — initial `None`; populated with an `AmsdalContext()`; reset to `None` during `teardown()`.
 
-Additionally, a global side effect occurs in `__init__`: `ReferenceLoaderManager().set_reference_loader(ReferenceLoader)` registers the `ReferenceLoader` class on the global singleton.
+### `__init__(self) -> None`
 
-### Lifecycle
+Steps in order:
+1. `self._config_manager = AmsdalConfigManager()`.
+2. Try `config = self._config_manager.get_config()`. If it raises `AttributeError` (caught as `err`), raises `AmsdalRuntimeError` with exact message `'Missing config. Use AmsdalConfigManager().set_config() before using AmsdalManager'`, chained `from err`.
+3. `self._config = config`.
+4. `self._data_application = DataApplication()`.
+5. `self._is_setup = False`.
+6. `self.__is_authenticated = False`.
+7. `ReferenceLoaderManager().set_reference_loader(ReferenceLoader)` — registers the concrete reference loader class.
+8. `self._metadata_manager = MetadataInfoManager()`.
+9. `self._metadata_manager.register_metadata_info_query(MetadataInfoQuery)` (sync-specific call).
+10. Sets `self._frozen = False`, and the three `_default_*_context` attributes to `None`.
+11. Calls `self._install_layer_contexts()`.
 
-1. `__init__(*, raise_on_new_signup=False)` — create singleton, register shared services.
-2. `pre_setup()` — register models modules and insert user models dir into `sys.path`.
-3. `setup()` — internally calls `pre_setup()`, then sets up data connections.
-4. `post_setup()` — wrapped in `@transaction`; registers internal classes and internal tables.
-5. `authenticate()` — optional; runs license auth; required before `cloud_actions_manager` is accessible.
-6. `apply_fixtures()` — optional; wrapped in `@transaction`; loads and applies fixtures.
-7. `teardown()` — tears down and invalidates all singletons.
+Side effects: mutates the global reference-loader manager and metadata manager; installs/activates module-global layer contexts (see `_install_layer_contexts`).
 
----
+### `is_setup` (property) -> bool
 
-### `__init__(self, *, raise_on_new_signup: bool = False) -> None`
+Returns `self._is_setup`.
 
-Keyword-only argument `raise_on_new_signup` (default `False`).
+### `is_authenticated` (property) -> bool
 
-Step-by-step:
-
-1. Locally imports `AuthManager` from `amsdal.cloud.services.auth.manager` (lazy import to avoid circular import at module load).
-2. Assigns `self._config_manager = AmsdalConfigManager()` — a singleton, so the same instance across calls.
-3. Calls `self._config_manager.get_config()` inside a `try` block.
-   - If it raises `AttributeError`, catches it and raises `AmsdalRuntimeError` with the exact message `'Missing config. Use AmsdalConfigManager().set_config() before using AmsdalManager'`, chained from the original via `from err`.
-4. Stores the returned `AmsdalConfig` in `self._config`.
-5. Creates `self._data_application = DataApplication()` (singleton; not yet set up).
-6. Initializes flags: `self._is_setup = False`, `self.__is_authenticated = False`.
-7. Calls `ReferenceLoaderManager().set_reference_loader(ReferenceLoader)` — global registration of the reference loader class.
-8. Creates `self._metadata_manager = MetadataInfoManager()` (singleton) and immediately calls `self._metadata_manager.register_metadata_info_query(MetadataInfoQuery)`.
-9. Creates `self._class_manager = ClassManager()` (singleton).
-10. Tries to construct `self._auth_manager = AuthManager()`:
-    - If `AuthManager.__init__` raises `AmsdalMissingCredentialsError`:
-      1. Calls `SignupService.signup_prompt()`.
-         - If it returns falsy, the original `AmsdalMissingCredentialsError` is re-raised (bare `raise`).
-         - If it returns truthy (user completed signup):
-           - If `raise_on_new_signup` is `True`, raises a new `AmsdalSignupError()` chained from the original error (`from e`). Note: this happens *after* a successful signup prompt but before re-attempting `AuthManager()`.
-           - Otherwise, re-invokes `AuthManager()` and stores the result in `self._auth_manager`. If this second attempt also fails, the exception propagates (no further handling).
-
-### `is_setup` (property) → `bool`
-
-Returns `self._is_setup`. No side effects.
-
-### `is_authenticated` (property) → `bool`
-
-Returns the private `self.__is_authenticated` (name-mangled). No side effects.
+Returns `self.__is_authenticated` (the name-mangled flag). True only after `authenticate()` succeeded.
 
 ### `pre_setup(self) -> None`
 
-Builds the model module registration list and prepends the user-models parent directory to `sys.path`.
-
-1. Initializes empty list `contrib: list[tuple[str, ModuleType]] = []`.
-2. For each `_contrib` string in `settings.CONTRIBS`:
-   - Splits from the right with `rsplit('.', 2)` → three parts; keeps only the first (`_contrib_path`), discards the other two.
-   - Appends tuple `(f'{_contrib_path}.models', ModuleType.CONTRIB)` to `contrib`.
-3. Calls `self._class_manager.register_models_modules(modules=[...], clear_previously_registered=True)`. The `modules` list is built in this exact order:
+Registers model modules and ensures the user models path is importable.
+1. Builds `contrib: list[tuple[str, ModuleType]] = []`. For each `_contrib` string in `settings.CONTRIBS`: splits with `_contrib.rsplit('.', 2)` taking the first part `_contrib_path` (drops the last two dotted segments), appends the tuple `(f'{_contrib_path}.models', ModuleType.CONTRIB)`.
+2. Calls `get_class_manager().register_models_modules(modules=[...], clear_previously_registered=True)`. The `modules` list, in exact order, is:
    - `('amsdal.models.core', ModuleType.CORE)`
    - `('amsdal.models.types', ModuleType.TYPE)`
-   - all entries from `contrib` (unpacked with `*contrib`)
+   - `*contrib` (all contrib tuples expanded in order)
    - `(settings.USER_MODELS_MODULE, ModuleType.USER)`
-4. Computes `_user_models_path = str(settings.user_models_path.parent.absolute())`.
-5. If `_user_models_path not in sys.path`, inserts it at position 0 via `sys.path.insert(0, _user_models_path)`. Otherwise no-op.
-
-Side effect: mutates `sys.path`.
+   `clear_previously_registered=True` wipes any prior registrations.
+3. Computes `_user_models_path = str(settings.user_models_path.parent.absolute())`.
+4. If `_user_models_path not in sys.path`: `sys.path.insert(0, _user_models_path)` (prepended so user models resolve first).
 
 ### `setup(self) -> None`
 
-Primary synchronous setup entry point.
+Full framework startup; idempotency-guarded.
+1. If `self._is_setup` is truthy: raise `AmsdalRuntimeError('AmsdalManager is already setup')`.
+2. `self.pre_setup()`.
+3. `self._run_bootstrap_phase()` (imports + resolves all model classes, then `_freeze()`).
+4. Imports `freeze as freeze_lifecycle` from `amsdal_models.classes.loading`; calls `freeze_lifecycle(strict=settings.STRICT_BOOTSTRAP)` — locks the model-loading lifecycle; `strict` taken from settings.
+5. `self.connect_data(self._config)` — sets up the data application and binds data-layer managers to the current data context.
+6. Imports `get_background_transaction_manager` from `amsdal_data.contexts`; calls `get_background_transaction_manager().initialize_connection(raise_on_no_worker=False)` — lazily initializes the background transaction connection without raising if no worker is present.
+7. Imports `register_pii_crypto_service` from `amsdal.services.pii_cryptor`; calls `register_pii_crypto_service()`.
+8. `self._is_setup = True`.
 
-1. If `self._is_setup` is `True`, raises `AmsdalRuntimeError('AmsdalManager is already setup')`.
-2. Calls `self.pre_setup()` (registers model modules, touches `sys.path`).
-3. Calls `self._data_application.setup(self._config)` — establishes data connections using the stored config.
-4. Sets `self._is_setup = True`.
-5. Calls `BackgroundTransactionManager().initialize_connection(raise_on_no_worker=False)` — gets the singleton and initializes its connection tolerantly (does not raise if no worker is available).
-6. Lazy-imports `register_pii_crypto_service` from `amsdal.services.pii_cryptor`.
-7. Calls `register_pii_crypto_service(settings.PII_CRYPTOR_BASE_URL, settings.PII_CRYPTOR_CLIENT_ID)`.
+Note: `setup()` does NOT call `post_setup()` or `apply_fixtures()`; callers invoke those separately.
 
-Note: if step 3 raises, `_is_setup` remains `False`, but `pre_setup` side effects (class manager registration, `sys.path` mutation) are NOT undone.
+### `_freeze(self) -> None`
 
-### `post_setup(self) -> None`
+Asserts invariant K1: no registered class has unresolved deferred references. Iterates EVERY class registered in the class manager (including classes created at import time before the manager existed).
+1. Imports `BootstrapError` from `amsdal_models.classes.loading`, and the constants `DEFERRED_FOREIGN_KEYS`, `DEFERRED_M2M_FIELDS`, `DEFERRED_PRIMARY_KEYS` from `amsdal_models.classes.relationships.constants` (these constants are attribute-name strings).
+2. `cm = get_class_manager()`; `seen: set[type] = set()`.
+3. Iterates `cm._loaded_classes.items()` as `(_module_type, by_name)`. `by_name` maps `class_name -> versions`.
+4. For each `(class_name, versions)`:
+   - If `isinstance(versions, dict)`: `entries = versions.values()`; else `entries = [versions]`.
+   - For each `entry`: resolves the class object `cls = getattr(entry, 'cls', None) or (entry[0] if isinstance(entry, tuple) else entry)` — i.e. uses `entry.cls` if present/truthy, else first tuple element if a tuple, else the entry itself.
+   - If `cls in seen`: `continue`. Else add to `seen`.
+   - For each `attr_name` in the tuple `(DEFERRED_PRIMARY_KEYS, DEFERRED_FOREIGN_KEYS, DEFERRED_M2M_FIELDS)`: `leftover = getattr(cls, attr_name, None)`. If `leftover` is truthy: raise `BootstrapError` with message `f'class {class_name} has unresolved {attr_name} after bootstrap: {leftover!r}'`.
+5. After the loop (no leftovers found): `self._frozen = True`.
 
-Decorated with `@transaction` (from `amsdal_data.transactions.decorators`) — runs the body inside a transaction.
+### `_install_layer_contexts(self) -> None`
 
-1. Calls `self.register_internal_classes()` (provided by `ClassVersionsMixin`).
-2. Calls `self._data_application.register_internal_tables()` — creates internal tables in the configured data stores.
+Creates and activates per-layer default contexts that are module-global (visible from any task/thread). Important for FastAPI/ASGI where request handlers run in sibling tasks of the lifespan-setup task.
+1. Imports `AmsdalDataContext`, `set_default_data_context` (`amsdal_data.contexts`); `FileClassRegistry` (`amsdal_models.classes.registry`); `AmsdalModelsContext`, `set_default_models_context` (`amsdal_models.contexts`); `AmsdalContext`, `set_default_context` (`amsdal.contexts`).
+2. Data layer: `self._default_data_context = AmsdalDataContext()` (empty placeholder; data fields populated later by `connect_data`); `set_default_data_context(self._default_data_context)`.
+3. Imports `ClassManager` from `amsdal_models.classes.class_manager`.
+4. Models layer: `self._default_models_context = AmsdalModelsContext(class_registry=FileClassRegistry(), class_manager=ClassManager())`; `set_default_models_context(self._default_models_context)`.
+5. Framework layer: `self._default_framework_context = AmsdalContext()` (empty placeholder); `set_default_context(self._default_framework_context)`.
+
+### `connect_data(self, config: AmsdalConfig) -> None`
+
+Initializes data-layer state and binds it to the current `AmsdalDataContext`. Components are created in strict dependency order (docstring rationale: HSVM, transaction manager, table schema manager each read prior components via the context, so order matters and `table_schema_manager` MUST be last).
+1. Imports: `HistoricalSchemaVersionManager` (`amsdal_data.connections.historical.schema_version_manager`); `current_data_context` (`amsdal_data.contexts`); `TableSchemasManager` (`amsdal_data.services.table_schema_manager`); `BackgroundTransactionManager` (`amsdal_data.transactions.background.manager`); `AmsdalTransactionManager` (`amsdal_data.transactions.manager`).
+2. `self._data_application.setup(config)`.
+3. `ctx = current_data_context()`.
+4. Assigns, in order: `ctx.data_application = self._data_application`; `ctx.historical_schema_version_manager = HistoricalSchemaVersionManager()`; `ctx.transaction_manager = AmsdalTransactionManager()`; `ctx.background_transaction_manager = BackgroundTransactionManager()`; `ctx.table_schema_manager = TableSchemasManager()`.
+
+### `_run_bootstrap_phase(self) -> None`
+
+Eager-imports all registered model modules and bulk-resolves deferred references (replaces lazy `complete_deferred_*` calls in the metaclass). Reverse-FK draining happens automatically inside the metaclass `__new__` during import; no separate drain here.
+1. Imports `ModelImporter`, `TopologicalResolver` from `amsdal_models.classes.loading`.
+2. `cm = get_class_manager()`.
+3. `importer = ModelImporter(modules=cm._models_modules)`.
+4. `imported = importer.import_all()` — `imported` is an iterable of `(cls, module_type)` tuples.
+5. `classes = [cls for cls, _mt in imported]`.
+6. Imports `ClassSource` (`amsdal_models.classes.class_manager`) and `current_models_context` (`amsdal_models.contexts`).
+7. `registry = current_models_context().class_registry`.
+8. For each `(cls, module_type)` in `imported`: `registry.register(cls, module_type=module_type, module_path=cls.__module__, source=ClassSource.FILE)`.
+9. `TopologicalResolver().resolve_classes(classes)` — bulk-resolves deferred PKs/FKs/M2M.
+10. For each `cls` in `classes`: `try: cls.model_rebuild(force=True)` — rebuilds the Pydantic schema after FK/M2M field changes. `except Exception: pass` (broad bare-suppress; tolerates edge cases like `TypeModel` / partial models). The final invariant is enforced by `_freeze()`.
+11. `self._freeze()`.
+
+### `post_setup(self) -> None`  (decorated `@transaction`)
+
+Runs inside a transaction. Registers internal classes and creates internal tables.
+1. `self.register_internal_classes()` — from the mixin, registers last versions for `Object`, `Transaction`, `Metadata`, `Reference`, `Migration` with version `''`.
+2. `self._data_application.register_internal_tables()`.
 
 ### `_check_auth(self) -> None`
 
-Private guard. If `self.__is_authenticated` is falsy, raises `AmsdalAuthenticationError('AmsdalManager is not authenticated')`. Otherwise returns `None`.
+Authentication guard.
+1. Imports `LicenseGuard` from `amsdal.license.guard`.
+2. Condition: `if not (self.__is_authenticated or LicenseGuard.is_valid())`. I.e. raises only when BOTH the instance flag is False AND `LicenseGuard.is_valid()` returns falsy. In that case raises `AmsdalAuthenticationError('AmsdalManager is not authenticated')`. Otherwise returns silently.
 
-### `cloud_actions_manager` (property) → `CloudActionsManager`
+### `cloud_actions_manager` (property) -> CloudActionsManager
 
-1. Calls `self._check_auth()` — raises `AmsdalAuthenticationError` if not authenticated.
-2. Returns a fresh `CloudActionsManager()` (note: not cached — a new instance is created on every access; however, `CloudActionsManager` may itself be a singleton).
+1. Calls `self._check_auth()` (raises `AmsdalAuthenticationError` if not authenticated and license invalid).
+2. Returns a freshly constructed `CloudActionsManager()` (new instance each access).
 
 ### `authenticate(self) -> None`
 
-1. Sets `self.__is_authenticated = False` (defensive reset; if auth fails, the previous authenticated state is cleared).
-2. Calls `self._auth_manager.authenticate()`. If it raises, the exception propagates and `__is_authenticated` remains `False`.
-3. On success, sets `self.__is_authenticated = True`.
+1. Imports `LicenseGuard` from `amsdal.license.guard`.
+2. `LicenseGuard.ensure_valid()` — raises if the license is invalid (exception type/behavior defined in `LicenseGuard`, not here).
+3. On success: `self.__is_authenticated = True`.
 
-### `apply_fixtures(self) -> None`
+### `apply_fixtures(self) -> None`  (decorated `@transaction`)
 
-Decorated with `@transaction`. Loads fixtures from all contrib packages and the user fixtures path.
-
+Loads and applies fixtures, contrib fixtures first then app fixtures, inside a transaction.
 1. `_contrib_fixture_paths = []`.
-2. For each `contrib_module` in `settings.CONTRIBS`:
-   - `package_name, _ = contrib_module.rsplit('.', 1)` — strips the last dotted segment.
-   - `_contrib_module = import_module(package_name)` — dynamic import; may raise `ImportError`/`ModuleNotFoundError`.
-   - `_fixtures_path = Path(_contrib_module.__file__ or '').parent / 'fixtures'` — if `__file__` is `None`, uses empty string → resulting path becomes `/fixtures` from current directory (likely non-existent).
-   - If `_fixtures_path.exists()` AND `_fixtures_path.is_dir()`, appends to `_contrib_fixture_paths`. Otherwise silently skipped.
-3. Constructs `manager = FixturesManager(fixtures_paths=[*_contrib_fixture_paths, settings.fixtures_root_path])` — contrib paths come first, user path last.
-4. Calls `manager.load_fixtures()` — reads/parses.
-5. Calls `manager.apply_file_fixtures()` — applies file-based fixtures.
-6. Calls `manager.apply_fixtures()` — applies remaining fixtures.
+2. For each `contrib_module` string in `settings.CONTRIBS`:
+   - `package_name, _ = contrib_module.rsplit('.', 1)` (drops the last dotted segment).
+   - `_contrib_module = import_module(package_name)`.
+   - `_fixtures_path = Path(_contrib_module.__file__ or '').parent / 'fixtures'` (uses `''` if `__file__` is None, making the path `fixtures` relative to cwd).
+   - If `_fixtures_path.exists() and _fixtures_path.is_dir()`: append it to `_contrib_fixture_paths`.
+3. `manager = FixturesManager(fixtures_paths=[*_contrib_fixture_paths, settings.fixtures_root_path])` — contrib paths first, app `fixtures_root_path` last.
+4. `manager.load_fixtures()`.
+5. `manager.apply_file_fixtures()`.
+6. `manager.apply_fixtures()`.
 
 ### `init_classes(self) -> None`
 
-**No-op.** The body is an `...` (Ellipsis) with commented-out code. Despite its docstring describing iteration over class schemas, it does nothing at runtime. Preserved as a placeholder.
+No-op. Body is fully commented out plus a bare `...`. Returns None and does nothing. (Historically iterated schema manager class schemas, skipping `SchemaTypes.TYPE`, importing the rest.)
 
 ### `teardown(self) -> None`
 
-Reverses setup and invalidates all singletons. Order matters — singletons are invalidated late so that instance methods can still be called first.
-
-1. Lazy-imports `AuthManager`.
-2. If `self._is_setup` is `False`, raises `AmsdalRuntimeError('AmsdalManager is not setup')`.
-3. `self._data_application.teardown()` — closes connections on the instance.
-4. `DataApplication.invalidate()` — clears the singleton from `Singleton` registry.
-5. `BackgroundTransactionManager.invalidate()` — clears that singleton (no prior `teardown()` is called on the instance).
-6. `self._class_manager.teardown()` — instance teardown.
-7. `self._class_manager.__class__.invalidate()` — invalidates the `ClassManager` singleton.
-8. `HistoricalSchemaVersionManager().clear_versions()` — obtains the singleton and clears its version cache.
-9. `HistoricalSchemaVersionManager.invalidate()`.
-10. `ReferenceLoaderManager.invalidate()`.
-11. `MetadataInfoManager.invalidate()`.
-12. `AmsdalConfigManager.invalidate()`.
-13. `self.__class__.invalidate()` — invalidates `AmsdalManager` itself so the next `AmsdalManager()` builds a fresh instance.
-14. `AuthManager.invalidate()`.
-15. Sets `self._is_setup = False`.
-
-Note: if step 3 raises, subsequent invalidations are NOT performed and `_is_setup` remains `True`. No try/except/finally.
+Full cleanup on application exit; guarded.
+1. Imports `AuthManager` from `amsdal.cloud.services.auth.manager`.
+2. If `not self._is_setup`: raise `AmsdalRuntimeError('AmsdalManager is not setup')`.
+3. `self._frozen = False`.
+4. If `self._default_data_context is not None`: imports `get_historical_schema_version_manager` (`amsdal_data.contexts`); calls `get_historical_schema_version_manager().clear_versions()`. (Done BEFORE clearing contexts, because the accessor would raise once the context is cleared.)
+5. `self._data_application.teardown()`.
+6. If `self._default_models_context is not None`: imports `unfreeze as unfreeze_lifecycle` (`amsdal_models.classes.loading`); calls `unfreeze_lifecycle()`; then `get_class_manager().teardown()`.
+7. If `self._default_framework_context is not None`: imports `clear_default_context` (`amsdal.contexts`); calls `clear_default_context()`; sets `self._default_framework_context = None`.
+8. If `self._default_models_context is not None`: imports `clear_default_models_context` (`amsdal_models.contexts`); sets `self._default_models_context.class_manager = None`; calls `clear_default_models_context()`; sets `self._default_models_context = None`.
+9. If `self._default_data_context is not None`: imports `clear_default_data_context` (`amsdal_data.contexts`); detaches data-layer state in this exact order BEFORE clearing (so callers via `current_data_context()` see `None` not a half-torn manager): `table_schema_manager = None`, `background_transaction_manager = None`, `transaction_manager = None`, `historical_schema_version_manager = None`, `data_application = None`; then `clear_default_data_context()`; `self._default_data_context = None`.
+10. Class-level invalidations, in exact order: `ReferenceLoaderManager.invalidate()`; `MetadataInfoManager.invalidate()`; `AmsdalConfigManager.invalidate()`; `self.__class__.invalidate()` (drops this manager from the `Singleton` cache); `AuthManager.invalidate()`.
+11. `self._is_setup = False`.
 
 ---
 
 ## `AsyncAmsdalManager`
 
-Async counterpart of `AmsdalManager`. Behavior, state, and lifecycle are identical except where noted. The differences are substitutions of async equivalents for I/O-bound components. The private `__is_authenticated` attribute here is mangled to `_AsyncAmsdalManager__is_authenticated`.
+`class AsyncAmsdalManager(ClassVersionsMixin, metaclass=Singleton)`
+
+Asynchronous mirror of `AmsdalManager`. Same singleton semantics, same state attributes, same overall flow. Only the differences are described here; everything else is identical to the sync class above (including `pre_setup`, `_freeze`, `_install_layer_contexts`, `_run_bootstrap_phase`, `_check_auth`, `cloud_actions_manager`, `authenticate`, `init_classes`, `is_setup`, `is_authenticated`).
 
 ### State differences
 
-- `_data_application: AsyncDataApplication` instead of `DataApplication`.
-- Uses `AsyncBackgroundTransactionManager` instead of `BackgroundTransactionManager`.
-- Uses `AsyncHistoricalSchemaVersionManager` instead of `HistoricalSchemaVersionManager`.
-- Uses `AsyncFixturesManager` instead of `FixturesManager`.
-- `post_setup` is decorated with `@async_transaction`; `apply_fixtures` is decorated with `@async_transaction`.
+- `_data_application: AsyncDataApplication` — constructed as `AsyncDataApplication()` instead of `DataApplication()`.
+- `__is_authenticated` is name-mangled to `_AsyncAmsdalManager__is_authenticated`.
+- All other attributes (`_config_manager`, `_config`, `_is_setup`, `_metadata_manager`, `_frozen`, the three `_default_*_context`) have the same names, types, and initial values as the sync class.
 
-### `__init__(self, *, raise_on_new_signup: bool = False) -> None`
+### `__init__(self) -> None`
 
-Identical to `AmsdalManager.__init__` step-by-step, except `self._data_application = AsyncDataApplication()`. Same error message `'Missing config. Use AmsdalConfigManager().set_config() before using AmsdalManager'` for missing config (the string is unchanged and still references "AmsdalManager", not "AsyncAmsdalManager"). Same signup-handling flow.
+Identical to sync `__init__` except:
+- Step 4: `self._data_application = AsyncDataApplication()`.
+- Step 9: `self._metadata_manager.register_async_metadata_info_query(AsyncMetadataInfoQuery)` (instead of `register_metadata_info_query(MetadataInfoQuery)`).
+- Same `AmsdalRuntimeError` message on missing config: `'Missing config. Use AmsdalConfigManager().set_config() before using AmsdalManager'`.
 
-### `is_setup` / `is_authenticated`
+### `connect_data(self, config: AmsdalConfig) -> None`  (async)
 
-Same as sync counterparts. `is_authenticated` reads `_AsyncAmsdalManager__is_authenticated`.
+Async counterpart of `AmsdalManager.connect_data`. Same structure/order, but uses async component classes and awaits setup.
+1. Imports: `AsyncHistoricalSchemaVersionManager` (`amsdal_data.connections.historical.schema_version_manager`); `current_data_context` (`amsdal_data.contexts`); `AsyncTableSchemasManager` (`amsdal_data.services.table_schema_manager`); `AsyncBackgroundTransactionManager` (`amsdal_data.transactions.background.manager`); `AmsdalAsyncTransactionManager` (`amsdal_data.transactions.manager`).
+2. `await self._data_application.setup(config)`.
+3. `ctx = current_data_context()`.
+4. Assigns in order: `ctx.data_application = self._data_application`; `ctx.historical_schema_version_manager = AsyncHistoricalSchemaVersionManager()`; `ctx.transaction_manager = AmsdalAsyncTransactionManager()`; `ctx.background_transaction_manager = AsyncBackgroundTransactionManager()`; `ctx.table_schema_manager = AsyncTableSchemasManager()`.
 
-### `pre_setup(self) -> None`
+### `setup(self) -> None`  (async)
 
-**Synchronous** (not a coroutine). Implementation byte-identical to `AmsdalManager.pre_setup()` — same `rsplit('.', 2)` discarding two segments, same module list order, same `sys.path` mutation.
+Same as sync `setup` except step 5 is `await self.connect_data(self._config)`. All other steps identical, including the `'AmsdalManager is already setup'` guard message, `freeze_lifecycle(strict=settings.STRICT_BOOTSTRAP)`, `get_background_transaction_manager().initialize_connection(raise_on_no_worker=False)` (NOT awaited — synchronous call), and `register_pii_crypto_service()`. Sets `self._is_setup = True` at the end.
 
-### `setup(self) -> None` (async)
+### `post_setup(self) -> None`  (async, decorated `@async_transaction`)
 
-`async def`. Differences from sync version:
-
-1. Guard `if self._is_setup:` → raises `AmsdalRuntimeError('AmsdalManager is already setup')` (same message).
-2. Calls `self.pre_setup()` synchronously.
-3. `await self._data_application.setup(self._config)` — awaited.
-4. Sets `self._is_setup = True`.
-5. Calls `AsyncBackgroundTransactionManager().initialize_connection(raise_on_no_worker=False)` — note `initialize_connection` here is called synchronously (not awaited); the method on the async manager is non-coroutine in the call path used here.
-6. Lazy-imports and calls `register_pii_crypto_service(settings.PII_CRYPTOR_BASE_URL, settings.PII_CRYPTOR_CLIENT_ID)` — same as sync.
-
-### `post_setup(self) -> None` (async)
-
-`async def`, decorated with `@async_transaction`.
-
-1. Calls `self.aregister_internal_classes()` — NOTE: the call is NOT awaited. This is a method provided by `ClassVersionsMixin`; if it returns a coroutine, the coroutine would be discarded (potential bug / known behavior to reason about). Debugging tip: if internal classes appear missing in async mode, investigate whether `aregister_internal_classes` is actually a coroutine that needs awaiting.
+1. `await self.aregister_internal_classes()` (the async mixin classmethod).
 2. `await self._data_application.register_internal_tables()`.
 
-### `_check_auth(self) -> None`
+### `apply_fixtures(self) -> None`  (async, decorated `@async_transaction`)
 
-Same semantics and error message as sync version.
+Same contrib-path discovery loop as the sync version (identical `rsplit('.', 1)`, `import_module`, `Path(... or '').parent / 'fixtures'`, `exists() and is_dir()` checks). Differences:
+- `manager = AsyncFixturesManager(fixtures_paths=[*_contrib_fixture_paths, settings.fixtures_root_path])`.
+- `manager.load_fixtures()` (synchronous).
+- `await manager.apply_file_fixtures()`.
+- `await manager.apply_fixtures()`.
 
-### `cloud_actions_manager` (property)
+### `teardown(self) -> None`  (async)
 
-Same semantics. `_check_auth()` first, then returns `CloudActionsManager()`. Property itself is synchronous.
-
-### `authenticate(self) -> None`
-
-**Synchronous** (not async). Identical to sync `authenticate`: resets `__is_authenticated` to `False`, calls `self._auth_manager.authenticate()` (non-awaited), sets `True` on success.
-
-### `apply_fixtures(self) -> None` (async)
-
-`async def`, decorated with `@async_transaction`.
-
-1. Builds `_contrib_fixture_paths` with the same logic as sync version (including the same edge case where `_contrib_module.__file__ or ''` can produce `/fixtures` if `__file__` is `None`).
-2. `manager = AsyncFixturesManager(fixtures_paths=[*_contrib_fixture_paths, settings.fixtures_root_path])`.
-3. `manager.load_fixtures()` — synchronous call (not awaited).
-4. `await manager.apply_file_fixtures()` — awaited.
-5. `await manager.apply_fixtures()` — awaited.
-
-### `init_classes(self) -> None`
-
-**No-op.** Same as sync version — commented-out body.
-
-### `teardown(self) -> None` (async)
-
-`async def`. Identical structure to sync teardown, with async substitutions:
-
-1. Lazy-import `AuthManager`.
-2. If `self._is_setup` is `False`, raises `AmsdalRuntimeError('AmsdalManager is not setup')` (message unchanged — still says "AmsdalManager").
-3. `await self._data_application.teardown()`.
-4. `AsyncDataApplication.invalidate()`.
-5. `AsyncBackgroundTransactionManager.invalidate()`.
-6. `self._class_manager.teardown()` (sync).
-7. `self._class_manager.__class__.invalidate()`.
-8. `AsyncHistoricalSchemaVersionManager().clear_versions()` — sync call on the singleton.
-9. `AsyncHistoricalSchemaVersionManager.invalidate()`.
-10. `ReferenceLoaderManager.invalidate()`.
-11. `MetadataInfoManager.invalidate()`.
-12. `AmsdalConfigManager.invalidate()`.
-13. `self.__class__.invalidate()` — invalidates the `AsyncAmsdalManager` singleton.
-14. `AuthManager.invalidate()`.
-15. `self._is_setup = False`.
-
-Same caveat: if step 3 raises, subsequent cleanup does not execute.
+Identical to sync `teardown` step-for-step except step 5 is `await self._data_application.teardown()`. The guard message is `'AmsdalManager is not setup'`. `clear_versions()`, `unfreeze_lifecycle()`, `get_class_manager().teardown()`, context detach/clear order, and the five class-level invalidations (`ReferenceLoaderManager.invalidate()`, `MetadataInfoManager.invalidate()`, `AmsdalConfigManager.invalidate()`, `self.__class__.invalidate()`, `AuthManager.invalidate()`) are all the same. Ends with `self._is_setup = False`.
 
 ---
 
-## Exceptions raised by this module
+## Typical lifecycle / call order
 
-| Exception | Condition | Exact message |
-|---|---|---|
-| `AmsdalRuntimeError` | `__init__` cannot get config (`AttributeError` from `get_config`) | `'Missing config. Use AmsdalConfigManager().set_config() before using AmsdalManager'` |
-| `AmsdalRuntimeError` | `setup()` when already set up | `'AmsdalManager is already setup'` |
-| `AmsdalRuntimeError` | `teardown()` when not set up | `'AmsdalManager is not setup'` |
-| `AmsdalAuthenticationError` | `_check_auth()` / `cloud_actions_manager` access when not authenticated | `'AmsdalManager is not authenticated'` |
-| `AmsdalSignupError` | `__init__` when `raise_on_new_signup=True` and signup prompt succeeded | (no explicit message; default exception) |
-| `AmsdalMissingCredentialsError` | `__init__` when credentials missing AND `SignupService.signup_prompt()` returned falsy | re-raised from `AuthManager()` |
+1. Construct config via `AmsdalConfigManager().set_config(...)` (external, before using the manager — otherwise `__init__` raises `AmsdalRuntimeError`).
+2. `manager = AmsdalManager()` / `AsyncAmsdalManager()` — installs layer contexts.
+3. `manager.setup()` / `await manager.setup()` — pre_setup → bootstrap → freeze lifecycle → connect_data → background tx init → PII crypto register; sets `_is_setup=True`.
+4. `manager.post_setup()` / `await ...` — registers internal classes + tables (transactional).
+5. Optional `manager.authenticate()` and `manager.apply_fixtures()`.
+6. `manager.teardown()` / `await ...` — reverses everything and invalidates singletons; sets `_is_setup=False`.
 
-## Key external interactions
+## Error/exception summary
 
-- `AmsdalConfigManager` / `AmsdalConfig` — configuration source; must be pre-configured via `set_config()` before instantiating the manager.
-- `DataApplication` / `AsyncDataApplication` — connection lifecycle (`setup(config)`, `register_internal_tables()`, `teardown()`, class-level `invalidate()`).
-- `ClassManager` — model modules registration via `register_models_modules(modules=..., clear_previously_registered=True)`.
-- `ClassVersionsMixin` — provides `register_internal_classes()` (sync) and `aregister_internal_classes()` (used in async `post_setup`).
-- `AuthManager` (lazy-imported from `amsdal.cloud.services.auth.manager`) — raises `AmsdalMissingCredentialsError` on construction if credentials are missing; `authenticate()` performs license verification.
-- `SignupService.signup_prompt()` — interactive path triggered only when credentials are missing.
-- `FixturesManager` / `AsyncFixturesManager` — `load_fixtures()`, `apply_file_fixtures()`, `apply_fixtures()` pipeline.
-- `settings` from `amsdal.configs.main` — reads `CONTRIBS`, `USER_MODELS_MODULE`, `user_models_path`, `fixtures_root_path`, `PII_CRYPTOR_BASE_URL`, `PII_CRYPTOR_CLIENT_ID`.
-- `register_pii_crypto_service` from `amsdal.services.pii_cryptor` — called once at end of `setup()`.
-- `Singleton` metaclass — provides `invalidate()` class method used throughout `teardown()`.
-
-## Debugging hints
-
-- If `AmsdalManager()` raises `AmsdalRuntimeError` about missing config, the caller forgot to call `AmsdalConfigManager().set_config(...)` before instantiating the manager.
-- If attributes appear stale after a `teardown()` + re-instantiation cycle, note that both `self.__class__.invalidate()` and all dependent singletons are invalidated; any external references to old instances are stale.
-- If `init_classes()` appears not to do anything — it doesn't. It's a stub.
-- In `AsyncAmsdalManager.post_setup()`, `aregister_internal_classes()` is called without `await` — if it returns a coroutine, that coroutine is never awaited (RuntimeWarning about never-awaited coroutine, and internal classes not registered).
-- `authenticate()` is synchronous even on `AsyncAmsdalManager`; it calls the sync `AuthManager.authenticate()`.
-- The `__is_authenticated` flag is name-mangled per-class (`_AmsdalManager__is_authenticated` vs `_AsyncAmsdalManager__is_authenticated`); external inspection must use the correct mangled name.
-- `teardown()` has no `try/finally` — a failure in `_data_application.teardown()` leaves singletons live and `_is_setup=True`.
-- Contrib fixture path resolution silently skips contribs whose `fixtures/` subdirectory does not exist; check filesystem if a contrib's fixtures are unexpectedly not applied.
+- `AmsdalRuntimeError('Missing config. Use AmsdalConfigManager().set_config() before using AmsdalManager')` — in `__init__` when `get_config()` raises `AttributeError`.
+- `AmsdalRuntimeError('AmsdalManager is already setup')` — in `setup()` when `_is_setup` is already True.
+- `AmsdalRuntimeError('AmsdalManager is not setup')` — in `teardown()` when `_is_setup` is False.
+- `AmsdalAuthenticationError('AmsdalManager is not authenticated')` — in `_check_auth()` (and thus `cloud_actions_manager`) when not authenticated and `LicenseGuard.is_valid()` is falsy.
+- `BootstrapError('class {class_name} has unresolved {attr_name} after bootstrap: {leftover!r}')` — in `_freeze()` when any registered class still has a truthy deferred-PK/FK/M2M attribute.
+- `LicenseGuard.ensure_valid()` (in `authenticate()`) may raise its own exception if the license is invalid.

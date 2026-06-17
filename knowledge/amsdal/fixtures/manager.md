@@ -1,240 +1,247 @@
-# Module: `amsdal.fixtures.manager`
+# `amsdal.fixtures.manager`
 
-This module provides managers for loading, processing, and applying fixture data (data + binary files) to the AMSDAL database. It supports two I/O modes (sync `FixturesManager`, async `AsyncFixturesManager`) sharing a common loading base (`BaseFixturesManager`).
+Loads fixture definitions from JSON/CSV files (or directory trees), and applies them to the AMSDAL database as versioned `Fixture`, `File`, and arbitrary model objects.
 
-Module-level objects:
-- `logger = logging.getLogger(__name__)` — used for all logging (namespace `amsdal.fixtures.manager`).
-- Third-party imports of note: `numpy as np`, `pandas as pd` (used only for CSV loading), and — unusually — `from black.trans import defaultdict`. The `defaultdict` re-export from Black's internals is used to back `self.fixtures`. Functionally equivalent to `collections.defaultdict`, but a dependency on `black` must exist.
-- Imports `process_fixture_value` from `amsdal.fixtures.utils`. Model imports (`File`, `Fixture`) are deferred inside methods to avoid import cycles.
+## Module-level imports and globals
+
+- `copy`, `json`, `logging`, `uuid` (stdlib); `Generator` from `collections.abc`; `Path` from `pathlib`; `Any` from `typing`.
+- `numpy as np`, `pandas as pd` (used for CSV loading).
+- `Model` from `amsdal_models.classes.model`.
+- `MANY_TO_MANY_FIELDS` from `amsdal_models.classes.relationships.constants` — a string attribute-name constant used with `getattr` to read a model's M2M field map.
+- `get_class_manager` from `amsdal_models.contexts` — returns the class manager used to import model classes by name.
+- `AmsdalConfigManager` from `amsdal_utils.config.manager`.
+- `Versions` from `amsdal_utils.models.enums` — uses `Versions.LATEST`.
+- `defaultdict` is imported from `black.trans` (re-exported there; behaves as the stdlib `collections.defaultdict`).
+- `BaseModel` from `pydantic`; `FieldInfo` from `pydantic.fields`.
+- `process_fixture_value` from `amsdal.fixtures.utils` (see "External helper" section below).
+- `logger = logging.getLogger(__name__)`.
 
 ---
 
 ## `FixtureData` (pydantic `BaseModel`)
 
-A typed container describing a single, fully-parsed fixture record.
+Value object describing one fixture record. Fields (all required, no defaults):
 
-State (fields, all required unless noted):
-- `class_name: str` — the AMSDAL model class name the fixture belongs to (e.g., `"Company"`).
-- `external_id: str` — the stable logical identifier used for upserts and cross-references between fixtures. May be `None`/empty in edge cases (see `_load_fixtures`), even though typed `str`.
-- `order: float` — sort key used by `iter_fixtures`. Lower values are applied first.
-- `data: dict[str, Any]` — the remaining per-object attributes after `_external_id`, `_order`, and `external_id` have been popped out.
-
-No custom validators, no lifecycle hooks.
+- `class_name: str` — name of the target model class.
+- `external_id: str` — external identifier used as the object id / lookup key.
+- `order: float` — ordering weight used when applying fixtures.
+- `data: dict[str, Any]` — the fixture payload (field values).
 
 ---
 
 ## `BaseFixturesManager`
 
-Responsible for reading fixtures from disk into memory, arranging them by order, and providing a per-object data-transform used by subclasses before persistence.
+Base class holding loading logic and shared state. Subclassed by `FixturesManager` (sync) and `AsyncFixturesManager` (async); the apply logic differs only in sync vs async DB calls.
 
-Class constants:
-- `ORDER_MULTIPLIER: int = 10` — multiplier applied to the index of each path in `fixtures_paths`; defines the precedence window between different fixture roots.
-- `MAX_FIXTURE_DEPTH: int = 10` — maximum depth for recursive directory traversal before the method bails out with a warning.
+### Class attributes
+
+- `ORDER_MULTIPLIER: int = 10` — per-path order offset multiplier.
+- `MAX_FIXTURE_DEPTH: int = 10` — maximum directory recursion depth.
 
 ### `__init__(self, fixtures_paths: list[Path]) -> None`
 
-Initializes in-memory state:
-1. Stores the input list verbatim in `self.fixtures_paths: list[Path]`.
-2. Creates `self.fixtures: dict[str | int, list[tuple[float, FixtureData]]] = defaultdict(list)` (imported from `black.trans`). Keyed by `external_id` (string/int/None), value is a list of `(order, FixtureData)` pairs.
-3. Instantiates `self._class_manager = ClassManager()` (from `amsdal_models.classes.class_manager`) — used later to resolve class names to model classes.
-4. Instantiates `self._config_manager = AmsdalConfigManager()` — held but not directly referenced by this class; available to subclasses/consumers.
+Instance state set:
+
+- `self.fixtures_paths = fixtures_paths` — list of `Path` roots to load from.
+- `self.fixtures: dict[str | int, list[tuple[float, FixtureData]]] = defaultdict(list)` — maps an `external_id` key to a list of `(order_value, FixtureData)` tuples. A `defaultdict(list)`, so unknown keys auto-create an empty list.
+- `self._class_manager = get_class_manager()`.
+- `self._config_manager = AmsdalConfigManager()` (constructed but not referenced elsewhere in this class).
 
 ### `load_fixtures(self) -> None`
 
-Iterates `self.fixtures_paths` via `enumerate`, and for each `(idx, fixtures_path)` pair invokes `self._load_fixtures(fixtures_path, order_shift=self.ORDER_MULTIPLIER * idx)`. So the first path's order shift is `0`, the second `10`, the third `20`, etc. This means later paths are guaranteed to apply after earlier paths for any `order` less than `ORDER_MULTIPLIER`.
+Iterates `enumerate(self.fixtures_paths)`. For each `(idx, fixtures_path)` calls `self._load_fixtures(fixtures_path, order_shift=self.ORDER_MULTIPLIER * idx)`. So path 0 gets shift 0, path 1 gets shift 10, path 2 gets shift 20, etc. Returns `None`.
 
 ### `_load_fixtures(self, fixtures_path: Path, order_shift: int = 0) -> None`
 
-Loads fixtures from a single path (file or directory).
+1. If `not fixtures_path.exists()`: return immediately (no error).
+2. Initialize local `fixtures: list[dict[str, Any]] = []`.
+3. Branch on path type:
+   - If `fixtures_path.is_dir()`: call `self._load_fixtures_recursive(fixtures_path, fixtures, order_shift, depth=0, max_depth=self.MAX_FIXTURE_DEPTH)` to populate `fixtures`.
+   - Else (a file): open it, `json.load`. If the parsed value is `not isinstance(..., dict)`, raise `ValueError('Fixture data must be a dictionary')`. Otherwise append the dict to `fixtures`.
+4. Iterate each `fixture` dict in `fixtures`:
+   - Compute `group_order`: `if group_order := fixture.get('order'):` — i.e. only if `fixture['order']` is truthy. When truthy, `group_order += order_shift`. NOTE: `'order'` is treated as a top-level key of the fixture dict and is *also* iterated as a class name below (it is not removed).
+   - For each `class_name` in `fixture` (every top-level key):
+     - For each `fixture_element` in `fixture[class_name]` (expects a list of dicts):
+       - `external_id = fixture_element.pop('_external_id', None)`.
+       - `order = fixture_element.pop('_order', 0) + order_shift`.
+       - If `not external_id and 'external_id' in fixture_element`: `external_id = fixture_element.pop('external_id')` (fallback to a public `external_id` key, also removing it from the element).
+       - Build `fixture_data = FixtureData(class_name=class_name, external_id=external_id, order=order, data=fixture_element)`. (`fixture_element` is the remaining dict after the pops.)
+       - Append to `self.fixtures[external_id]` the tuple `(group_order or order or 0, fixture_data)` — the order value is the first truthy of `group_order`, then `order`, else `0`.
 
-Step-by-step:
-1. If `fixtures_path.exists()` is `False`, returns immediately (silent).
-2. Initializes local `fixtures: list[dict[str, Any]] = []`. Each element is a mapping `{class_name: [fixture_element, ...]}`.
-3. Branching on path type:
-   - If `fixtures_path.is_dir()`: calls `self._load_fixtures_recursive(fixtures_path, fixtures, order_shift, depth=0, max_depth=self.MAX_FIXTURE_DEPTH)`.
-   - Else (assumed file): opens the file, `json.load`s it into `_fixture_data`. If `_fixture_data` is not a `dict`, raises `ValueError('Fixture data must be a dictionary')`. Otherwise appends `_fixture_data` to `fixtures`.
-4. Iterates each `fixture` dict in `fixtures`:
-   - Reads optional group order: `group_order := fixture.get('order')`. If truthy (non-zero, non-None), adds `order_shift` to it. **Bug-worthy quirk**: `'order'` is treated as a class name in the inner loop too, because there is no `continue`/filter — see below.
-   - Iterates `for class_name in fixture:` (includes the `'order'` key if present) and then `for fixture_element in fixture[class_name]:`. If `'order'` was a scalar (int/float) rather than a list, iterating over it will raise `TypeError`. Fixtures containing a top-level `'order'` key must therefore have it be list-like or absent.
-   - Per `fixture_element` (a dict):
-     - `external_id = fixture_element.pop('_external_id', None)`.
-     - `order = fixture_element.pop('_order', 0) + order_shift`.
-     - If `not external_id` and `'external_id' in fixture_element`, sets `external_id = fixture_element.pop('external_id')`. Note this only runs if `_external_id` was missing/falsy; if `_external_id` was present, plain `external_id` remains inside the fixture's data.
-     - Builds `FixtureData(class_name=class_name, external_id=external_id, order=order, data=fixture_element)`.
-     - Appends `(group_order or order or 0, fixture_data)` to `self.fixtures[external_id]`. The ordering value precedence is: `group_order` if truthy, else `order` if truthy, else `0`. Zero/None all collapse to `0`.
-
-Edge cases:
-- If `external_id` ends up `None`/empty, all such fixtures are bucketed under key `None` in `self.fixtures`. They are still iterated and applied, but `external_id` on the resulting `FixtureData` will be `None`, which `_process_fixture` / `_process_fixture_object_data` will then try to use verbatim.
+Edge cases: if `external_id` is `None`/`''`, the tuple is stored under that key; multiple records sharing the key accumulate in one list. Because `'order'` is iterated as a class name, a fixture file with a top-level `"order"` numeric value will attempt `for fixture_element in <number>` and fail with a `TypeError` (numbers are not iterable). Top-level `order` is intended for grouping, but the code does not skip it.
 
 ### `_load_fixtures_recursive(self, current_path, fixtures, order_shift, depth=0, max_depth=10) -> None`
 
-Traverses a directory tree to identify "class folders" (Pattern A) and "explicit class JSON files" (Pattern B).
+Recursively walks a directory tree, supporting two layouts:
+- Pattern A: a folder named after a class, containing CSV files and/or JSON files whose top-level value is a **list**.
+- Pattern B: a standalone `.json` file whose top-level value is a **dict** mapping class names to record lists.
 
-Step-by-step:
-1. If `depth >= max_depth`, logs warning `'Max fixture nesting depth %s reached at %s, skipping deeper levels'` with `max_depth` and `current_path`, returns.
-2. Attempts `items = list(current_path.iterdir())`. On `OSError`, logs `'Cannot access directory %s: %s'` and returns.
-3. For each `item`:
-   - **If `item.is_dir()`:**
-     - Tries `dir_contents = list(item.iterdir())`. On `OSError`, logs `'Cannot access directory %s: %s'` and `continue`s.
-     - `has_csv_files`: `True` iff any `f` in `dir_contents` has suffix `.csv` AND `f.is_file()`.
-     - `has_json_list_files`: starts `False`. For each file with suffix `.json`, opens and `json.load`s it. If the loaded data `isinstance(..., list)`, sets `has_json_list_files = True` and breaks. Any `OSError` or `json.JSONDecodeError` during this probe is silently swallowed (`continue`). **Side effect: this causes JSON files to be parsed twice** (once here to classify, once later in `_load_class_folder_fixtures`).
-     - If `has_csv_files or has_json_list_files`: calls `self._load_class_folder_fixtures(item, fixtures)`. On `OSError` from that call, logs `'Cannot access directory %s: %s'` and continues. **Note**: `order_shift` is NOT propagated into `_load_class_folder_fixtures` — class-folder fixtures lose the per-path shift.
-     - Else: recurses with `self._load_fixtures_recursive(item, fixtures, order_shift, depth + 1, max_depth)`.
-   - **Elif `item.is_file() and item.suffix == '.json'`:** calls `self._load_explicit_class_fixture(item, fixtures)`.
-     - On `OSError`: logs `'Cannot read file %s: %s'`, `continue`.
-     - On `json.JSONDecodeError` or `ValueError`: logs `'Invalid JSON in file %s: %s'`, `continue`.
-   - All other items (symlinks not resolving to dir/file, non-JSON files at container level) are ignored silently.
+Steps:
 
-Classification rule summary: A subdirectory is treated as a **class folder** if it contains at least one CSV file OR at least one top-level JSON file whose content is a list. Otherwise it's a **container** and the function recurses.
+1. If `depth >= max_depth`: log warning `'Max fixture nesting depth %s reached at %s, skipping deeper levels'` (args `max_depth`, `current_path`) and return.
+2. `items = list(current_path.iterdir())`, wrapped in try/except `OSError as e`; on error log `'Cannot access directory %s: %s'` (`current_path`, `e`) and return.
+3. For each `item` in `items`:
+   - If `item.is_dir()`:
+     - List `dir_contents = list(item.iterdir())` in try/except `OSError`; on error log `'Cannot access directory %s: %s'` (`item`, `e`) and `continue`.
+     - `has_csv_files = any(f.suffix == '.csv' and f.is_file() for f in dir_contents)`.
+     - `has_json_list_files = False`; then for each `f` in `dir_contents`: if `f.is_file()` and `f.suffix == '.json'`, open and `json.load`; if the result `isinstance(data, list)`, set `has_json_list_files = True` and `break`. JSON load errors (`OSError`, `json.JSONDecodeError`) are caught and the file is skipped (`continue`).
+     - If `has_csv_files or has_json_list_files`: treat `item` as a class folder (Pattern A) and call `self._load_class_folder_fixtures(item, fixtures)` (wrapped in try/except `OSError` → log `'Cannot access directory %s: %s'` and `continue`). The folder name is assumed to be the class name without verification.
+     - Else: recurse via `self._load_fixtures_recursive(item, fixtures, order_shift, depth + 1, max_depth)` (treated as a container directory).
+   - Elif `item.is_file() and item.suffix == '.json'` (Pattern B): call `self._load_explicit_class_fixture(item, fixtures)`, wrapped in:
+     - except `OSError as e`: log `'Cannot read file %s: %s'` (`item`, `e`), `continue`.
+     - except `(json.JSONDecodeError, ValueError) as e`: log `'Invalid JSON in file %s: %s'` (`item`, `e`), `continue`.
+
+Note: `order_shift` is threaded through recursion but is not applied here; ordering is applied later in `_load_fixtures`.
 
 ### `_load_class_folder_fixtures(self, class_dir: Path, fixtures: list[dict[str, Any]]) -> None`
 
-Loads all fixtures from a directory whose **name equals a class name** (e.g., `Company/`).
+Loads all fixture files from one class-named directory (Pattern A). For each `model_file` in `class_dir.iterdir()`:
 
-For each `model_file` in `class_dir.iterdir()`:
-- **If suffix `.json`:**
-  - Opens, `json.load`s into `_fixture_data`.
-  - If not `isinstance(_fixture_data, list)`: raises `ValueError(f'Fixture data in {model_file} must be a list')` — caught below.
-  - Otherwise appends `{class_dir.name: _fixture_data}` to `fixtures`.
-  - `OSError` → warning `'Cannot read file %s: %s'`, continue.
-  - `json.JSONDecodeError` or `ValueError` → warning `'Invalid fixture in file %s: %s'`, continue.
-- **Elif suffix `.csv`:**
-  - Opens file. Reads via `pd.read_csv(csv_file).replace({np.nan: None}).to_dict(orient='records')`. Each row becomes a dict, with NaN values coerced to `None`.
-  - Appends `{class_dir.name: _fixture_data}` to `fixtures`.
-  - `OSError` → warning `'Cannot read file %s: %s'`, continue.
-  - Any other `Exception` → warning `'Invalid CSV in file %s: %s'`, continue. (Intentionally broad.)
-- Other suffixes are skipped silently.
+- If `model_file.suffix == '.json'`:
+  - Open, `json.load`. If `not isinstance(_fixture_data, list)`: raise `ValueError(f'Fixture data in {model_file} must be a list')`.
+  - Append `{class_dir.name: _fixture_data}` to `fixtures` (the folder name becomes the class name).
+  - except `OSError as e`: log `'Cannot read file %s: %s'` (`model_file`, `e`), `continue`.
+  - except `(json.JSONDecodeError, ValueError) as e`: log `'Invalid fixture in file %s: %s'` (`model_file`, `e`), `continue`. (The just-raised `ValueError` is caught here, so a non-list JSON is logged and skipped, not propagated.)
+- Elif `model_file.suffix == '.csv'`:
+  - Open and read via `pd.read_csv(csv_file).replace({np.nan: None}).to_dict(orient='records')` → list of row dicts with NaN replaced by `None`.
+  - Append `{class_dir.name: _fixture_data}` to `fixtures`.
+  - except `OSError as e`: log `'Cannot read file %s: %s'`, `continue`.
+  - except `Exception as e` (broad): log `'Invalid CSV in file %s: %s'` (`model_file`, `e`), `continue`.
+- Files with other suffixes are ignored.
 
 ### `_load_explicit_class_fixture(self, json_file: Path, fixtures: list[dict[str, Any]]) -> None`
 
-Loads a single `{"ClassName": [...], ...}` JSON file (Pattern B).
-
-- Opens and `json.load`s.
-- If the parsed value is not a `dict`, raises `ValueError(f'Fixture data in {json_file} must be a dictionary')`.
-- Otherwise appends the loaded dict to `fixtures`.
-
-Caller (`_load_fixtures_recursive`) is responsible for handling `OSError` and `JSONDecodeError`.
+Open `json_file`, `json.load`. If `not isinstance(_fixture_data, dict)`: raise `ValueError(f'Fixture data in {json_file} must be a dictionary')`. Otherwise append the dict to `fixtures`. (Caller wraps and logs exceptions.)
 
 ### `iter_fixtures(self) -> Generator[FixtureData, None, None]`
 
-Flattens all stored fixtures and yields them sorted by order.
-
-1. Flattens: `[(order, data) for class_name, values in self.fixtures.items() for order, data in values]`. Note the iteration variable is named `class_name`, but it is actually the dict key (an `external_id`). Misleading naming; no functional consequence.
-2. Sorts by `order` ascending using `sorted(..., key=lambda x: x[0])`. Sort is stable, so within the same order value, insertion order is preserved.
-3. Yields only the `FixtureData` instances (drops the order tuple element).
+1. Flatten `self.fixtures` into `flattened_fixtures = [(order, data) for class_name, values in self.fixtures.items() for order, data in values]`.
+2. `sorted_fixtures = sorted(flattened_fixtures, key=lambda x: x[0])` — ascending by the numeric order value.
+3. Yield each `fixture` (the `FixtureData`) from the sorted list in order. Lower order applied first.
 
 ### `_process_object_data(self, data, model_fields, m2m_fields) -> dict[str, Any]`
 
-Transforms a raw data dict in place (and returns it) by coercing each value according to the target model's field type, using `process_fixture_value` from `amsdal.fixtures.utils`.
+Casts each raw fixture value to the field's declared type. Parameters: `data: dict[str, Any]`, `model_fields: dict[str, FieldInfo]`, `m2m_fields: dict[str, type[Model]]`.
 
-For each `(key, value)` in `data.items()`:
-- If `key in m2m_fields`: let `_ref_type = m2m_fields[key]`; sets `data[key] = process_fixture_value(list[_ref_type], value)`. That is, coerces to a list of the related model class.
-- Else: assumes `key in model_fields`, takes `field_info = model_fields[key]`, sets `data[key] = process_fixture_value(field_info.annotation, value)`.
-
-Edge cases:
-- If `key` is absent from both `m2m_fields` and `model_fields`, lookup `model_fields[key]` raises `KeyError` unhandled.
-- `data` is mutated during iteration — `dict.items()` over Py3 iterates the snapshot of keys, but because we only reassign existing keys (not add/remove), this is safe.
+1. Build `fields_by_alias = {(field_info.alias or name): field_info for name, field_info in model_fields.items()}` — maps each field's pydantic alias (or its name when no alias) to its `FieldInfo`. This handles foreign-key fields, which are stored internally as `_<fk>_ref` and exposed publicly only via the alias, so a fixture key like `object_control` is absent from `model_fields` keyed by name but present in `fields_by_alias`.
+2. For each `key, value` in `data.items()`:
+   - If `key in m2m_fields`: `_ref_type = m2m_fields[key]`; set `data[key] = process_fixture_value(list[_ref_type], value)` — treats the value as a list of references to the M2M target model.
+   - Else: `field_info = model_fields.get(key) or fields_by_alias[key]` (lookup by name first, then by alias — a `KeyError` is raised if the key matches neither). Set `data[key] = process_fixture_value(field_info.annotation, value)`.
+3. Mutates and returns `data` (same dict object, values replaced in place).
 
 ---
 
-## `FixturesManager(BaseFixturesManager)`
+## `FixturesManager(BaseFixturesManager)` — synchronous
 
-Synchronous orchestrator that applies loaded fixtures to the database.
+Loads (via base class) and applies fixtures using synchronous DB execution (`.execute()`, `.save()`).
 
 ### `apply_file_fixtures(self) -> None`
 
-Applies binary file fixtures from a `files/` subdirectory of each fixtures path.
-
-For each `_dir` in `self.fixtures_paths`: computes `files_dir = _dir / 'files'` and calls `self._apply_file_fixtures(files_dir)`.
+For each `_dir` in `self.fixtures_paths`: compute `files_dir = _dir / 'files'` and call `self._apply_file_fixtures(files_dir)`. So binary file fixtures live in a `files/` subdirectory of each fixtures path.
 
 ### `_apply_file_fixtures(self, file_dir: Path) -> None`
 
-Guard: if not (`file_dir.exists()` AND `file_dir.is_dir()`), returns silently. Otherwise calls `self._apply_file_fixtures_rec(file_dir, file_dir)` — passing the same path as both the walker position and the base for relative keys.
+If `not (file_dir.exists() and file_dir.is_dir())`: return. Otherwise call `self._apply_file_fixtures_rec(file_dir, file_dir)` (base dir equals the start dir).
 
-### `_apply_file_fixtures_rec(self, nested_dir, base_dir) -> None`
+### `_apply_file_fixtures_rec(self, nested_dir: Path, base_dir: Path) -> None`
 
-Walks the `files/` tree. For each entry `nested_object` in `nested_dir.iterdir()`:
-- If directory: recurse (`self._apply_file_fixtures_rec(nested_object, base_dir)`), `continue`.
-- Elif file: calls `self._process_file_fixture(nested_object, f'{nested_object.relative_to(base_dir)}')`. The second argument is the path relative to the top-level `files/` directory, stringified — used as the file's external key.
+For each `nested_object` in `nested_dir.iterdir()`:
+- If `nested_object.is_dir()`: recurse `self._apply_file_fixtures_rec(nested_object, base_dir)`, then `continue`.
+- If `nested_object.is_file()`: call `self._process_file_fixture(nested_object, f'{nested_object.relative_to(base_dir)}')`. The `file_key` is the file path relative to `base_dir`, stringified (path string including subfolders).
 
-No error handling at this level: `OSError`, `PermissionError`, etc. propagate.
-
-### `apply_fixtures(self) -> None`
-
-Main entry point for applying data fixtures.
-
-For each `fixture` yielded by `self.iter_fixtures()` (already sorted by `order`):
-1. `fixture_data = self._process_fixture(fixture)` — upserts the `Fixture` meta-record.
-2. If `fixture_data` is truthy (i.e., there was a change), calls `self._process_fixture_object_data(class_name=fixture_data.class_name, external_id=fixture_data.external_id, data=fixture_data.data)` to upsert the actual target object.
-
-If `_process_fixture` returns `None` (no change detected), the object-data step is skipped entirely — meaning the target object is **not re-saved** when the fixture payload matches what's already recorded, even if someone else altered the target.
+No depth limit here (unlike the JSON loader).
 
 ### `_process_file_fixture(self, file_path: Path, file_key: str) -> None`
 
-Upserts a single file as an `amsdal.models.core.file.File` instance.
-
-1. Imports `File` lazily from `amsdal.models.core.file`.
-2. Opens `file_path` in binary mode; reads all bytes into `file_data`; computes `filename = file_path.resolve().name` (just the basename, resolved).
-3. Builds `data = {'filename': filename, 'data': file_data}`.
-4. Queries for an existing file: `File.objects.filter(_address__object_id=file_key, _address__object_version=Versions.LATEST).first().execute()`. Result typed as `File | None`.
+1. Local import: `from amsdal.models.core.file import File`.
+2. Open `file_path` in `'rb'`, read all bytes into `file_data`; `filename = file_path.resolve().name`.
+3. Build `data = {'filename': filename, 'data': file_data}`.
+4. Query existing: `File.objects.filter(_address__object_id=file_key, _address__object_version=Versions.LATEST).first().execute()` → `existing_file: File | None`.
 5. If `existing_file is not None`:
-   - Constructs a new candidate: `new_file = File.from_bytes(**data)`.
-   - If `new_file.data == existing_file.data`: logs `'Skipping creating new version of file for file_key=%s, no changes found'` and returns without saving.
-   - Else: logs `'Creating new version of fixture for file_key=%s'`, sets `existing_file.data = data['data']` (**only** `data`, not `filename`), and calls `existing_file.save()`. Filename updates are silently dropped.
-6. Else (no existing): logs `'Creating first fixture for external_id=%s'` (log uses `external_id` label but the value is `file_key`), instantiates `File(_object_id=file_key, filename=..., data=...)`, calls `instance.save(force_insert=True)`.
+   - `new_file = File.from_bytes(**data)`.
+   - If `new_file.data == existing_file.data`: log `'Skipping creating new version of file for file_key=%s, no changes found'` (`file_key`) and return (no write).
+   - Else: log `'Creating new version of fixture for file_key=%s'` (`file_key`); set `existing_file.data = data['data']`; `existing_file.save()`.
+6. Else (no existing file): log `'Creating first fixture for external_id=%s'` (`file_key`); `instance = File(_object_id=file_key, **data)`; `instance.save(force_insert=True)`.
 
-Note: the `File.data` equality check relies on `File.from_bytes`'s own semantics; if `from_bytes` performs transforms (e.g., compression, hashing), the equality is comparing post-transform payloads, not raw bytes.
+Note the change-detection compares `new_file.data` to `existing_file.data` (the `File`'s processed `data` attribute), not the raw bytes directly.
+
+### `apply_fixtures(self) -> None`
+
+For each `fixture` from `self.iter_fixtures()` (order-sorted):
+1. `fixture_data = self._process_fixture(fixture)`.
+2. If `fixture_data` is truthy (not `None`): call `self._process_fixture_object_data(class_name=fixture_data.class_name, external_id=fixture_data.external_id, data=fixture_data.data)`.
+
+So when `_process_fixture` returns `None` (unchanged fixture), the underlying object data is **not** re-applied.
 
 ### `_process_fixture(self, fixture: FixtureData) -> FixtureData | None`
 
-Upserts the `Fixture` meta-record that tracks each fixture's external_id ↔ data history.
+Records the fixture itself as a versioned `Fixture` registry object, and returns a fresh copy for object application (or `None` if unchanged).
 
-1. Imports `Fixture` lazily from `amsdal.models.core.fixture`.
+1. Local import: `from amsdal.models.core.fixture import Fixture`.
 2. `external_id = fixture.external_id`.
-3. Queries: `Fixture.objects.filter(external_id=external_id, _address__object_version=Versions.LATEST).first().execute()` into `existing_fixture: Model | None`.
+3. Query: `Fixture.objects.filter(external_id=external_id, _address__object_version=Versions.LATEST).first().execute()` → `existing_fixture: Model | None`.
 4. `class_name = fixture.class_name`.
 5. If `existing_fixture is not None`:
-   - If `fixture.data == existing_fixture.data`: logs `'Skipping creating new version of fixture for external_id=%s, no changes found'` and **returns `None`** (signals caller to skip object-data upsert).
-   - Else: logs `'Creating new version of fixture for external_id=%s'`, sets `existing_fixture.data = fixture.data`, calls `existing_fixture.save()`.
-6. Else: logs `'Creating first fixture for external_id=%s'`, creates `instance = Fixture(_object_id=uuid.uuid4().hex, external_id=external_id, data=fixture.data, class_name=class_name)`, calls `instance.save(force_insert=True)`. Note the `_object_id` is a fresh random UUID hex; identity lookup is via `external_id` field, NOT `_object_id`.
-7. Returns a fresh `FixtureData(external_id=external_id, class_name=class_name, data=copy.deepcopy(fixture.data), order=fixture.order)`. The deep copy insulates downstream mutation in `_process_fixture_object_data` from affecting the Fixture record just saved.
+   - If `fixture.data == existing_fixture.data`: log `'Skipping creating new version of fixture for external_id=%s, no changes found'` (`external_id`) and **return `None`**.
+   - Else: log `'Creating new version of fixture for external_id=%s'` (`external_id`); set `existing_fixture.data = fixture.data`; `existing_fixture.save()`.
+6. Else: log `'Creating first fixture for external_id=%s'` (`external_id`); create `Fixture(_object_id=uuid.uuid4().hex, external_id=external_id, data=fixture.data, class_name=class_name)`; `instance.save(force_insert=True)`. The `Fixture` object id is a random uuid4 hex (not the external id).
+7. Return `FixtureData(external_id=external_id, class_name=class_name, data=copy.deepcopy(fixture.data), order=fixture.order)` — `data` is deep-copied so later mutation in `_process_object_data` does not affect the stored `Fixture.data`.
 
-### `_process_fixture_object_data(self, class_name, external_id, data) -> None`
+### `_process_fixture_object_data(self, class_name: str, external_id: str, data: dict[str, Any]) -> None`
 
-Upserts the actual target object described by the fixture.
+Creates/updates the actual target model object.
 
-1. `class_model = self._class_manager.import_class(class_name)` — resolves the class by name (may raise if the class isn't registered).
-2. Queries for existing instance: `class_model.objects.filter(_address__object_id=external_id, _address__object_version=Versions.LATEST).first().execute()`. The `_object_id` address component equals the fixture's `external_id`.
-3. `m2m_fields = getattr(class_model, MANY_TO_MANY_FIELDS, None) or {}`. The `MANY_TO_MANY_FIELDS` attribute, if present, maps field name → tuple. Each tuple is `(ref_type, _, _, _)` — a 4-tuple where only the first element (the related model class) is used.
-4. Builds a reduced m2m map: `{_field: _ref_type for _field, (_ref_type, _, _, _) in m2m_fields.items()}`.
-5. `updated_data = self._process_object_data(data, model_fields=class_model.model_fields or {}, m2m_fields=...)` — coerces each value in `data`.
-6. `full_data = {**updated_data, '_object_id': external_id}` — pins the object id to the external_id for insert.
-7. Branch:
-   - If `existing_object is not None`: logs `'Creating new version of %s for external_id=%s'` with `class_model.__name__, external_id`. Iterates `for key, val in updated_data.items(): setattr(existing_object, key, val)` — mutates each attribute, then calls `existing_object.save()`. **Note**: `_object_id` is NOT reassigned (it's not in `updated_data`); attributes not present in `updated_data` remain untouched on the existing object.
-   - Else: logs `'Creating %s for external_id=%s'`, instantiates `instance = class_model(**full_data)` (passing `_object_id=external_id` as kwarg), and calls `instance.save(force_insert=True)`.
-
----
-
-## `AsyncFixturesManager(BaseFixturesManager)`
-
-Async counterpart to `FixturesManager`. Semantics are identical except for:
-- All persistence methods are `async def`.
-- Query execution uses `.aexecute()` instead of `.execute()`.
-- Saves use `instance.asave(...)` instead of `instance.save(...)`.
-- Methods `apply_file_fixtures`, `_apply_file_fixtures`, `_apply_file_fixtures_rec`, `apply_fixtures`, `_process_file_fixture`, `_process_fixture`, `_process_fixture_object_data` are coroutines and await their persistence calls.
-
-Notable detail: directory iteration still uses synchronous `Path.iterdir()` and file reads still use synchronous `open(...)`. Only database I/O is awaited.
-
-All log messages, equality checks, control flow branches, data shapes, field mappings, object-id handling, UUID generation for new `Fixture` records, deep-copy of `data` in the returned `FixtureData`, and `_process_object_data` usage match the synchronous version exactly. Any divergence between the two managers in behavior would be a bug, not an intentional difference.
+1. `class_model = self._class_manager.import_class(class_name)`.
+2. Query existing: `class_model.objects.filter(_address__object_id=external_id, _address__object_version=Versions.LATEST).first().execute()` → `existing_object: Model | None`.
+3. `m2m_fields = getattr(class_model, MANY_TO_MANY_FIELDS, None) or {}` — a dict mapping field name → a tuple `(ref_type, _, _, _)` (4-tuple).
+4. `updated_data = self._process_object_data(data, model_fields=class_model.model_fields or {}, m2m_fields={_field: _ref_type for _field, (_ref_type, _, _, _) in m2m_fields.items()})` — collapses each 4-tuple to just its first element (`_ref_type`).
+5. `full_data = {**updated_data, '_object_id': external_id}`.
+6. If `existing_object is not None`:
+   - Log `'Creating new version of %s for external_id=%s'` (`class_model.__name__`, `external_id`).
+   - For each `key, val` in `updated_data.items()`: `setattr(existing_object, key, val)` (note: `_object_id` is not set here, only the processed data fields).
+   - `existing_object.save()`.
+7. Else: log `'Creating %s for external_id=%s'` (`class_model.__name__`, `external_id`); `instance = class_model(**full_data)` (includes `_object_id`); `instance.save(force_insert=True)`.
 
 ---
 
-## Cross-cutting behaviors / debugging notes
+## `AsyncFixturesManager(BaseFixturesManager)` — asynchronous
 
-- **External ID resolution order** in `_load_fixtures`: `_external_id` > `external_id` (only if `_external_id` was missing/falsy) > `None`. `_external_id` is always popped; `external_id` is only popped when `_external_id` was missing/falsy.
-- **Order resolution** per stored tuple: `group_order or order or 0`. Group-level `order` (if truthy) overrides per-element `_order` entirely.
-- **`order_shift` leakage**: propagated to per-file/per-element `_order` in `_load_fixtures`, but NOT into `_load_class_folder_fixtures` (Pattern A). Class-folder fixtures therefore start at `_order=0` plus `order_shift` applied at the top level — meaning CSV/JSON-list-sourced entries inside class folders effectively get `order_shift` only via the outer loop since the top-level `for fixture in fixtures` iteration re-applies `order_shift` in `_load_fixtures`. So class-folder fixtures DO get `order_shift` because it's applied at the `fixture_element` level in the outer loop, not inside the class-folder loader. Verify at `_load_fixtures` line `order = fixture_element.pop('_order', 0) + order_shift`.
-- **Skip-on-no-change optimization**: `_process_fixture` returning `None` causes `_process_fixture_object_data` to be skipped. If the `Fixture` meta-record exists and matches but the target object has been deleted or modified externally, fixtures will NOT repair it.
-- **`black.trans.defaultdict`** is a runtime dependency on the `black` code formatter package; removal of `black` would break initialization.
-- **Double JSON parsing** in `_load_fixtures_recursive`: list-vs-dict classification reads each JSON file, then `_load_class_folder_fixtures` / `_load_explicit_class_fixture` reads it again. Large fixture trees incur this cost.
-- **Silent failures**: classification probe swallows `OSError`/`json.JSONDecodeError`; CSV loader swallows every `Exception` as a warning. Malformed fixtures may never raise, just disappear with a WARNING log line.
+Behaviorally identical to `FixturesManager` except all DB operations are awaited. The loading methods (`load_fixtures`, `_load_*`, `iter_fixtures`, `_process_object_data`) are inherited unchanged from the base class. Differences in the apply path:
+
+- `apply_file_fixtures` (async): same loop, `await self._apply_file_fixtures(files_dir)`.
+- `_apply_file_fixtures` (async): same guard, `await self._apply_file_fixtures_rec(...)`.
+- `_apply_file_fixtures_rec` (async): same traversal, `await` on recursive calls and on `self._process_file_fixture(...)`.
+- `apply_fixtures` (async): `fixture_data = await self._process_fixture(fixture)`; if truthy, `await self._process_fixture_object_data(...)`.
+- `_process_file_fixture` (async): same logic; existing lookup uses `.first().aexecute()`; updates use `await existing_file.asave()`; new file uses `await instance.asave(force_insert=True)`. Same log strings and the same `new_file.data == existing_file.data` skip check.
+- `_process_fixture` (async): same logic and same log strings; lookup uses `.aexecute()`; `await existing_fixture.asave()` / `await instance.asave(force_insert=True)`. Returns `None` on unchanged data, else a deep-copied `FixtureData`.
+- `_process_fixture_object_data` (async): same logic and log strings; lookup uses `.aexecute()`; `await existing_object.asave()` / `await instance.asave(force_insert=True)`.
+
+All exact string constants, branch conditions, dict keys, and data shapes match the synchronous counterparts above.
+
+---
+
+## External helper: `process_fixture_value` (`amsdal.fixtures.utils`)
+
+Referenced by `_process_object_data` to cast raw fixture values to typed values. Signature `process_fixture_value(annotation: Any, value: Any) -> Any`.
+
+1. If `not annotation` (falsy/`None`): return `None`.
+2. If `_is_optional(annotation)`: resolve the non-`None` member type via `_resolve_type_from_optional` and `return _cast_value_to_type(_type, value)`.
+   - `_is_optional` returns `True` if `annotation._name == 'Optional'`, or if `annotation` is a `UnionType` with exactly 2 args one of which is `NoneType`.
+3. Elif `isinstance(annotation, UnionType)` (PEP 604 `X | Y` that is not the optional case): raise `NotImplementedError('Union types are not supported in fixtures yet.')`.
+4. Else `return _cast_value_to_type(annotation, value)`.
+
+`_cast_value_to_type(value_type, value)` branches (in order):
+- `value is None` → return `None`.
+- `isinstance(value_type, GenericAlias)` (e.g. `dict[...]`, `list[...]`):
+  - origin `dict`: if `value` falsy, return as-is; else build a new dict casting each key and value recursively.
+  - origin `list`: if `value` is a `str`, split on `,` and strip each element; then cast each element recursively.
+  - any other origin: raise `NotImplementedError(f'Type "{value_type}" is not supported in fixtures!')`.
+- `typing._UnionGenericAlias` (e.g. `typing.Union[...]`): if it has 3 or 4 args, drop `LegacyModel`, `Reference`, and `NoneType`; if exactly one remains, recurse on it; otherwise raise `NotImplementedError('Union types are not supported in fixtures yet.')`. (This path handles AMSDAL FK annotations, which are unions of model/`Reference`/`LegacyModel`/`None`.)
+- `typing._LiteralGenericAlias`: return `value` unchanged.
+- `issubclass(value_type, Model)`: return `_construct_reference_value(class_name=value_type.__name__, object_id=value)` — builds a `Reference` with `ref` = `{class_name, class_version: Versions.LATEST, object_id: value, object_version: Versions.LATEST, resource: <connection name for the class>}`. This is how external-id strings become FK/M2M references.
+- `issubclass(value_type, TypeModel) and isinstance(value, dict)`: construct `value_type(**value)`.
+- `value_type in (int, float) and value == ''` → return `None`.
+- `isinstance(value, str) and value_type in [date, datetime]` → `date.fromisoformat(value)` (note: always returns a `date`, even for a `datetime` annotation).
+- `value_type is Any` → return `value`.
+- `value_type is bytes and isinstance(value, str)` → `value.encode('utf-8')`.
+- Fallback → `value_type(value)` (direct constructor call, e.g. `int(value)`, `str(value)`).

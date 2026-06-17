@@ -5,6 +5,7 @@
   "skills": [
     "./skills/amsdal-overview",
     "./skills/amsdal-models",
+    "./skills/amsdal-transactions",
     "./skills/amsdal-server",
     "./skills/amsdal-glue",
     "./skills/amsdal-deploy",
@@ -12,7 +13,8 @@
     "./skills/amsdal-plugins",
     "./skills/amsdal-ml",
     "./skills/amsdal-ecosystem",
-    "./skills/amsdal-frontend-configs"
+    "./skills/amsdal-frontend-configs",
+    "./skills/amsdal-mcp-chat"
   ],
   "agents": [
     "./agents/amsdal-expert.md"

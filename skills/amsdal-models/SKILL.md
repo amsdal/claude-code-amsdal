@@ -9,12 +9,45 @@ user-invocable: false
 
 # AMSDAL Models
 
+## Before you commit to anything concrete
+
+This skill is a routing index, not a complete or current spec. Before you finalize ANY concrete artifact — a model or field definition, a transaction or function signature, a config key, an import path, an API call — confirm it against an authoritative source FIRST:
+
+1. `knowledge/` — if it concerns runtime behavior / debugging.
+2. WebFetch the matching `docs.amsdal.com` page (map below) — for API / usage.
+
+Do this by default, NOT only when uncertain — you cannot detect what this skill silently omits. A construct being valid Python/Pydantic, or seeming obvious, is not evidence that AMSDAL supports it.
+
+**Docs map for this skill:**
+- field types (incl. what types are/aren't supported) → https://docs.amsdal.com/models/field-types/
+- model definition → https://docs.amsdal.com/models/model_definition/python-class/
+- relationships (FK / M2M) → https://docs.amsdal.com/models/relationships/
+- CRUD operations → https://docs.amsdal.com/models/classes/
+- querysets / filtering → https://docs.amsdal.com/models/queryset/queryset/
+- field lookups → https://docs.amsdal.com/models/queryset/fields-lookup/
+- Q objects → https://docs.amsdal.com/models/queryset/q-object/
+- transactions → https://docs.amsdal.com/models/transactions/
+- hooks → https://docs.amsdal.com/models/hooks/
+- metadata → https://docs.amsdal.com/models/metadata/
+- PII encryption → https://docs.amsdal.com/models/pii-encryption/
+- migrations → https://docs.amsdal.com/models/migrations/
+- fixtures → https://docs.amsdal.com/models/fixtures/
+- validation / serialization → https://docs.amsdal.com/models/pydantic/
+- external models → https://docs.amsdal.com/models/external-models/
+- file storage → https://docs.amsdal.com/models/file-storage/
+
 ## File Convention
 
 **Each model MUST be in its own file.** File name = model name in snake_case. Never put multiple models in one file.
 - `BookingOrder` → `src/models/booking_order.py`
 - `OrderItem` → `src/models/order_item.py`
 - `Author` → `src/models/author.py`
+
+**Imports use the `models.` / `transactions.` root — never `src.models.` / `src.transactions.`** — even though the files live under `src/`. A pre-build step collects `src/` into the project root, so imports are rooted there:
+- `from models.order_item import OrderItem`
+- `from transactions.create_order import create_order`
+
+This applies to `TypeModel` files and cross-model references too (e.g. `from models.address import Address`).
 
 ## Model Definition
 
@@ -62,16 +95,155 @@ class Employee(Person):
     company_name: str
 ```
 
-**Database result:** `Person` table + `Employee` table (with `first_name` + `company_name`), linked by `Employee.partition_key → Person.partition_key`. Querying is transparent — both parent and child fields are filterable on the child model. Migrations handle dependency order automatically (parent created before child).
+**Database result:** `Person` table + `Employee` table (with `first_name` + `company_name`), linked by a foreign key on the primary key. Querying is transparent — both parent and child fields are filterable on the child model. Migrations handle dependency order automatically (parent created before child).
+
+### TypeModel (Embedded Value Objects)
+
+For structured data that should live **inline inside an owning `Model`** (no table, no own id) — e.g. an address, a line item, or a chat message — subclass `TypeModel` instead of `Model`.
+
+```python
+from amsdal_models.classes.model import Model, TypeModel
+
+class Address(TypeModel):          # own file: src/models/address.py
+    street: str
+    city: str
+    zip_code: str | None = None
+
+class Company(Model):              # own file: src/models/company.py
+    name: str
+    headquarters: Address          # stored inline (JSONB) on the Company row
+    branches: list[Address] = []   # list of embedded value objects
+```
+
+The file convention still applies — **each `TypeModel` goes in its own file** too. When a `Model` references a `TypeModel` from another file, call `Model.model_rebuild()` after the class to resolve the reference.
+
+Key facts (from source):
+- **Stored inline (JSONB) inside the owning Model** via plain pydantic `model_dump()` — a `TypeModel` has no table, no `_object_id`, no `save()`/`delete()`, and is not queried on its own.
+- **No ORM fields inside it.** A `TypeModel` field may only be a primitive or another `TypeModel` — annotating a field with an ORM `Model` type raises `TypeError` at class creation. Use a `ReferenceField` on the owning `Model` for relations instead.
+- **No lifecycle hooks** run for `TypeModel` (`pre_*`/`post_*` create/update/delete are not called). Hooks belong on `Model`.
+- **No FK/PK/M2M/`__table_name__` ClassVars.** It does keep `__module_type__: ClassVar[ModuleType]` (default `USER`).
+- `validate_assignment=True`, and a JSON **string** is accepted where a `TypeModel` is expected — the `TypeModel` subclass parses it to a dict first (e.g. `Address.model_validate('{...}')`).
+
+### TimestampMixin (auto `created_at` / `updated_at`)
+
+Mix `TimestampMixin` into a `Model` for auto-managed timestamp fields. It is commonly wanted — **default to adding it when generating a model** (or ask the user first).
+
+```python
+from amsdal.models.mixins import TimestampMixin
+from amsdal.models import Model
+
+class Article(TimestampMixin, Model):     # mixin FIRST, then Model
+    title: str
+```
+
+- Adds `created_at: datetime | None` and `updated_at: datetime | None`.
+- **Auto-stamped via hooks:** `pre_create`/`apre_create` set `created_at`; `pre_update`/`apre_update` set `updated_at` (both `datetime.now(tz=UTC)`).
+- **Bulk operations skip hooks** — timestamps are NOT auto-set on `bulk_create`/`bulk_update`. Call `instance.stamp_timestamp(action='create')` / `stamp_timestamp(action='update')` before bulk-saving.
+- Pair with `__ordering__: ClassVar[str | list[str]] = ['-updated_at']` to list newest-first.
 
 ## Field Types
+
+Declaration syntax follows standard Python class annotations:
 
 - **Required:** `name: str`
 - **Optional:** `name: str | None = None`
 - **With default:** `age: int = 21`
-- **VectorField:** `embedding: VectorField(768)` — from `amsdal_models.classes.fields.vector`
-- **FileField:** `doc: File = FileField(storage=DBStorage())` — `FileField` from `amsdal_models.classes.fields.file`, `File` from `amsdal.models.core.file`
-- **PIIStr:** `email: PIIStr = Field(title='email')` — AES-256-GCM encrypted field, from `amsdal_models`
+
+For the authoritative set of supported field types — which Python types are allowed, AMSDAL special fields (vector, file, PII, references), and any type that is **not** supported — **WebFetch https://docs.amsdal.com/models/field-types/ and verify before choosing a type.** Do not assume a type works just because it is valid Python/Pydantic.
+
+### Restricting a field to a set of values
+
+AMSDAL **does** support enum-style fields. All three forms below convert to a schema property carrying `enum` + `options` metadata, which is what drives the dropdown rendering in Console — they do not "collapse" to an untyped value.
+
+```python
+from enum import Enum
+from typing import Any, Literal
+
+from pydantic import field_validator
+
+from amsdal.models import Model, validate_options
+
+
+# 1. Literal — fixes the allowed values at the type level
+class Product(Model):
+    size: Literal['small', 'medium', 'large']
+
+
+# 2. Enum subclass — becomes its own named type (options + labels)
+class Color(str, Enum):
+    RED = 'red'
+    GREEN = 'green'
+    BLUE = 'blue'
+
+class Item(Model):
+    color: Color
+
+
+# 3. validate_options — stays a plain `str`, validated at runtime
+class Package(Model):
+    unit: str
+
+    @field_validator('unit')
+    @classmethod
+    def validate_unit(cls: type, value: Any) -> Any:
+        return validate_options(value, options=['kg', 'g', 'lb'])
+```
+
+Use `Literal`/`Enum` to fix the type; use `validate_options` to keep a plain `str` field while still restricting (and rendering) the allowed set. See https://docs.amsdal.com/models/model_definition/python-class/ for the `validate_options` validator.
+
+## Display Name (UI-friendly labels)
+
+Every `Model` has a `display_name` property. **By default it returns the object's address (an id-like string)** — not user-friendly. Override it so Console and reference pickers show a readable label.
+
+**When generating a model, add a `display_name` whenever it has obvious human-readable field(s)** (name, title, label, code…).
+
+### Preferred: build it from the model's own scalar fields (no extra queries)
+
+```python
+class Customer(Model):
+    first_name: str
+    last_name: str
+
+    @property
+    def display_name(self) -> str:
+        return f'{self.first_name} {self.last_name}'
+```
+
+`display_name` shows up in Console object/list views and in **FK enrichment**: when another model references this one via FK, the server adds this `display_name` to the reference in list/detail responses (`_enrich_fk_display_names`), so the UI shows the label instead of a raw ref.
+
+Because FK enrichment calls `display_name` for **every row**, a `display_name` built from scalar fields costs nothing extra. Reaching through an FK/M2M inside it would trigger a reference load per row → N+1.
+
+### Including FK fields without N+1 (custom `api_objects` manager + `select_related`)
+
+**Default to the scalar form above.** Only pull an FK into the label when the related entity is genuinely part of how users identify this record — e.g. an invoice naturally reads as `{customer} — {number}`. If the model's own scalar fields already identify it, do **not** reach into an FK (and do not add `select_related`) just because you can.
+
+When the FK truly belongs in the label, make it cheap: bake `select_related` into a custom manager and expose it as **`api_objects`** — the REST/Console list endpoints use `api_objects` when present, otherwise the default `objects` (`get_api_manager`). (You do **not** need to declare `objects` — the base `Model` provides it automatically.)
+
+```python
+from typing import ClassVar
+
+from amsdal_models.managers.model_manager import Manager
+
+
+class InvoiceApiManager(Manager):
+    def get_queryset(self):
+        return super().get_queryset().select_related('customer')  # nested ok: 'customer__company'
+
+
+class Invoice(Model):
+    number: str
+    customer: Customer = ReferenceField(related_name='invoices')
+
+    api_objects: ClassVar[InvoiceApiManager] = InvoiceApiManager()  # used by the server APIs
+
+    @property
+    def display_name(self) -> str:
+        return f'{self.customer.display_name} — {self.number}'
+```
+
+With `select_related('customer')` baked into `api_objects.get_queryset()`, listing invoices loads each `customer` in the **same** query, so `self.customer` inside `display_name` hits memory, not the database — no N+1. Without the custom manager, the same `display_name` would issue one query per row.
+
+Rule of thumb: scalar `display_name` by default → only add the FK + `api_objects` + `select_related` when the related entity is part of the label's meaning.
 
 ## Relationships
 
@@ -85,13 +257,16 @@ class Person(Model):
     asset: Asset                                                    # simple FK — preferred!
     asset: Asset = ReferenceField(..., db_field='asset_id')         # custom column name
     asset: Asset = ReferenceField(..., on_delete=ReferenceMode.CASCADE)  # on delete behavior
+    asset: Asset = ReferenceField(..., related_name='people')       # custom reverse accessor name
 ```
 
 **ReferenceMode options:** `CASCADE`, `PROTECT`, `RESTRICT`, `SET_NULL`, `SET_DEFAULT`, `DO_NOTHING`
 
+**Reverse accessor:** Each FK exposes a reverse accessor on the target model. By default it is named `<model>_set` (e.g. `Book.author` → `author.book_set`). Override with `related_name='...'`; set `related_name='+'` to disable the reverse accessor entirely.
+
 ### Many-to-Many
 
-**IMPORTANT: M2M fields MUST NOT have a default value (no `= []`). This will raise `AmsdalModelError`.**
+**IMPORTANT: M2M fields MUST NOT have a default value (no `= []`). This raises `AmsdalModelError('Many-to-many relation cannot have default value')`.**
 
 ```python
 from amsdal.models import ManyReferenceField
@@ -104,7 +279,31 @@ class Person(Model):
         through=PersonAsset,
         through_fields=('person', 'asset'),
     )
+
+    # OR opt into a reverse M2M accessor on the target model:
+    assets: list[Asset] = ManyReferenceField(related_name='owners')  # asset.owners
 ```
+
+**Reverse M2M accessor:** Unlike FK, an M2M field has **no** reverse accessor by default (`related_name=None`). Pass `related_name='...'` to install `target.<related_name>` returning the source objects via the through-table.
+
+### Reading a FK in async mode returns an awaitable
+
+In `async_mode`, accessing a forward FK on a **loaded** instance (e.g. `comment.article`) returns an **awaitable**, not the resolved instance — sync reference loading is forbidden in async context. (A freshly-assigned instance is returned synchronously, which can mask the bug in a single happy-path test.) Always guard before use:
+
+```python
+import inspect
+from amsdal_utils.models.data_models.reference import Reference
+
+async def get_article(comment: 'Comment') -> 'Article':
+    article = comment.article
+    if inspect.isawaitable(article):
+        article = await article
+    if isinstance(article, Reference):
+        article = await article.aload()
+    return article
+```
+
+Or simply `article = await comment.article` when you know it is stored as a reference. This applies to **reading FK attributes off a model**; it is separate from transaction arguments (where the server resolves references for plain-Model annotations — see [[amsdal-transactions]]).
 
 ### Frozen References
 Pin a reference to a specific version:
@@ -192,7 +391,8 @@ person = person.refetch_from_db(latest=True)    # latest version
 | `order_by(*fields)` | QuerySet | Sort (prefix `-` for desc) |
 | `distinct(fields)` | QuerySet | Unique results |
 | `only(fields)` | QuerySet | Load specific fields only |
-| `select_related(*fields)` | QuerySet | Eager-load relations |
+| `select_related(*fields)` | QuerySet | Eager-load FK relations (SQL JOIN) |
+| `prefetch_related(*args: str \| Prefetch)` | QuerySet | Eager-load reverse-FK / M2M / FK relations (separate queries) |
 | `using(alias)` | QuerySet | Use specific connection |
 | `latest()` | QuerySet | Latest versions only |
 | `annotate(**kwargs)` | QuerySet | Add annotations |
@@ -242,100 +442,74 @@ for p in persons:
     print(p.company.location.name)  # already loaded
 ```
 
+### prefetch_related (Reverse-FK / M2M / FK, no N+1)
+
+Where `select_related` JOINs forward FKs into one query, `prefetch_related` runs **one extra query per relationship** and stitches the results onto the parent instances. Use it for reverse-FK accessors (`author.book_set`), M2M fields, and forward FKs you want batched.
+
+```python
+from amsdal_models.querysets.prefetch import Prefetch
+
+# String lookup — populates the relationship cache; accessor returns loaded results
+authors = Author.objects.prefetch_related('book_set').execute()
+for a in authors:
+    for book in a.book_set:   # no extra query
+        print(book.title)
+
+# Forward FK and M2M lookups work too
+users = User.objects.prefetch_related('profile').execute()
+posts = Post.objects.prefetch_related('tags').execute()
+
+# Nested — dotted path follows the relationship chain
+authors = Author.objects.prefetch_related('book_set__publisher').execute()
+```
+
+**`Prefetch` for finer control** — `@dataclass(frozen=True) Prefetch(lookup, queryset=None, to_attr=None)`:
+
+```python
+# Custom queryset on the target (filter / order_by / only are allowed)
+Author.objects.prefetch_related(
+    Prefetch('book_set', queryset=Book.objects.filter(title__icontains='guide').order_by('title')),
+).execute()
+
+# Nested via a custom queryset that itself prefetches
+Author.objects.prefetch_related(
+    Prefetch('books_with_publisher', queryset=BookWithPublisher.objects.prefetch_related('publisher')),
+).execute()
+
+# to_attr — results land as a plain list on instance.__dict__ (NOT the relationship cache)
+authors = Author.objects.prefetch_related(
+    Prefetch('book_set', queryset=Book.objects.all(), to_attr='collected_books'),
+).execute()
+for a in authors:
+    a.collected_books   # plain list[Book]; a.book_set is left untouched
+```
+
+**Custom-queryset constraints (validated at `Prefetch(...)` construction time):**
+- Must be a multi-object `QuerySet` — not `.get()` / `.first()` / `.last()`.
+- Cannot use `using()` — the database is inherited from the parent queryset.
+- Cannot be sliced (`[a:b]`), and cannot use `distinct()` or `annotate()`.
+
+`to_attr` must not collide with an existing field, M2M field, or reverse accessor name — this is checked at `execute()` / `aexecute()` time (not at `Prefetch(...)` construction), raising `ValueError`.
+
+**M2M through-model rule:** when prefetching an M2M field with a custom queryset, the queryset MUST target the auto-generated **through-model**, not the target model. Passing a target-model queryset raises `AmsdalQuerySetError`.
+
+```python
+# WRONG — raises AmsdalQuerySetError
+Post.objects.prefetch_related(Prefetch('tags', queryset=Tag.objects.filter(active=True)))
+
+# RIGHT — filter on the through-model (exposed as Post.tags_through)
+Post.objects.prefetch_related(
+    Prefetch('tags', queryset=Post.tags_through.objects.select_related('tags').filter(...)),
+)
+```
+
 ## Transactions
 
-```python
-from amsdal.transactions import transaction, async_transaction
+Business logic lives in `@transaction` / `@async_transaction` functions, auto-exposed at `/api/transactions/<name>/`. See the **[[amsdal-transactions]]** skill for the full surface — defining them, model arguments & reference resolution, importing models inside the function, permissions decorator order, background/scheduled transactions, and rollback.
 
-@transaction
-def create_person(first_name: str) -> Person:
-    p = Person(first_name=first_name)
-    p.save()
-    return p
-
-@async_transaction
-async def create_person(first_name: str) -> Person:
-    p = Person(first_name=first_name)
-    await p.asave()
-    return p
-
-# With metadata
-@transaction(name='Create Person', tags=['person', 'create'])
-def create_person(...): ...
-
-# Nested transactions are independent — inner rollback doesn't affect outer
-```
-
-### Model References in Transaction Arguments
-
-When a transaction accepts a model as input (e.g. selecting a Book in an order), **use `Reference | Model` type inside a Pydantic `BaseModel`**. The AMSDAL Console will render a proper picker/selector for the model, and the REST API will accept a reference object. Inside the transaction, resolve the reference with `.load()` / `.aload()`.
-
-**IMPORTANT:** Never use `list[dict]` or `dict[str, Any]` for structured input — the REST API won't generate a proper JSON schema and the Console can't render a form. Always use a typed Pydantic `BaseModel`.
-
-```python
-from pydantic import BaseModel
-from amsdal.transactions import async_transaction
-from amsdal_utils.models.data_models.reference import Reference
-
-from models.book import Book
-
-
-class OrderItemInput(BaseModel):
-    book: Reference | Book   # Console renders as a Book picker
-    quantity: int
-
-
-@async_transaction(name='PlaceOrder', tags=['orders'])
-async def place_order(
-    customer_name: str,
-    items: list[OrderItemInput],
-) -> Order:
-    for raw_item in items:
-        item = raw_item if isinstance(raw_item, OrderItemInput) else OrderItemInput(**raw_item)
-        book = item.book
-
-        # Resolve reference to actual model instance
-        if isinstance(book, Reference):
-            book = await book.aload()
-
-        # Now use book.title, book.price, etc.
-        ...
-```
-
-**Key rules:**
-- Use `Reference | Model` (not just `Model`) — the API sends a reference, not the full object
-- Always check `isinstance(book, Reference)` and call `.aload()` (async) or `.load()` (sync) to get the real instance
-- Use `BaseModel` (not AMSDAL `Model`) for input DTOs — these are not stored in the DB
-- Handle `raw_item` as either dict or `OrderItemInput` since the server may pass raw dicts
-
-### Background Transactions (Celery)
-```python
-@transaction
-def send_email(email: str) -> None: ...
-
-@transaction
-def create_and_notify(name: str, email: str) -> Person:
-    p = Person(first_name=name).save()
-    send_email.submit(email)  # runs in background
-    return p
-```
-
-### Scheduled Transactions
-```python
-@transaction(schedule=600)  # every 10 minutes
-def cleanup(): ...
-
-@transaction(schedule_config=ScheduleConfig(schedule=Crontab(minute=0, hour=0)))
-def daily_report(): ...
-```
-
-### Rollback
-```python
-from amsdal.utils.rollback import rollback_to_timestamp, rollback_transaction
-
-rollback_to_timestamp(metadata.updated_at)
-rollback_transaction(metadata.transaction.ref.object_id)
-```
+Two rules worth keeping in mind while modeling, both covered there:
+- A single model argument should be annotated as the **plain Model** (`book: Book`), not `Reference | Model` — the server auto-loads the referenced object for plain-Model annotations.
+- In transaction/helper modules, import model classes **inside** the function (not at module top) so each call resolves the current model build.
 
 ## Hooks (Lifecycle)
 

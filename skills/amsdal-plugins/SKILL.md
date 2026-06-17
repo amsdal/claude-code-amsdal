@@ -9,6 +9,19 @@ user-invocable: false
 
 # AMSDAL Plugins
 
+## Before you commit to anything concrete
+
+This skill is a routing index, not a complete or current spec. Before you finalize ANY concrete artifact — an AppConfig, an event handler, a custom route/middleware, a config key, an import path, an API call — confirm it against an authoritative source FIRST:
+
+1. `knowledge/` — if it concerns runtime behavior / debugging.
+2. WebFetch the matching `docs.amsdal.com` page (map below) — for API / usage.
+
+Do this by default, NOT only when uncertain — you cannot detect what this skill silently omits. A construct being valid Python, or seeming obvious, is not evidence that AMSDAL supports it.
+
+**Docs map for this skill:**
+- plugins overview → https://docs.amsdal.com/models/plugins/overview/
+- events system → https://docs.amsdal.com/framework/events/
+
 ## Plugin Structure
 
 ```
@@ -35,6 +48,8 @@ from amsdal.contrib.app_config import AppConfig
 
 
 class MyPluginAppConfig(AppConfig):
+    title = 'My Plugin'  # optional — controls dashboard display
+
     def on_setup(self) -> None:
         from amsdal_utils.events import EventBus
         from amsdal_server.apps.common.events.server import RouterSetupEvent, ServerStartupEvent
@@ -43,6 +58,12 @@ class MyPluginAppConfig(AppConfig):
         EventBus.subscribe(RouterSetupEvent, MyRouteListener)
         EventBus.subscribe(ServerStartupEvent, MyStartupListener)
 ```
+
+**Optional overrides:**
+
+- `title` (class attribute) — how the app appears in places like the auto-synthesized dashboard. Defaults to `''`.
+- `slug` (property) — stable identifier, derived by convention from the package containing the AppConfig (e.g. `amsdal_storages.app.StoragesAppConfig` → `'amsdal_storages'`). Override if your package does not follow the standard `<package>.app.<NameAppConfig>` layout.
+- `models_module_prefix` (property) — module path under which the app's models live (e.g. `<package>.models`). Override if models live elsewhere.
 
 ### Registration
 
@@ -71,12 +92,12 @@ from amsdal_utils.events import Event, EventContext, EventListener, EventBus, li
 
 ### Defining Events & Contexts
 
+`EventContext` is a **frozen Pydantic model** (`BaseModel`, `arbitrary_types_allowed`). Declare subclasses plainly — do **not** use `@dataclass` (it breaks `create_next()` / `model_copy()` / history).
+
 ```python
-from dataclasses import dataclass
 from amsdal_utils.events import Event, EventContext
 
 
-@dataclass
 class MyContext(EventContext):
     value: int
     processed: bool = False
@@ -203,12 +224,14 @@ version = result.get_by_listener('listener_id')     # specific version
 Use `ModuleType.CONTRIB` to indicate plugin models:
 
 ```python
+from typing import ClassVar
+
 from amsdal.models import Model
 from amsdal_utils.models.enums import ModuleType
 
 
 class AuditLog(Model):
-    __module_type__ = ModuleType.CONTRIB
+    __module_type__: ClassVar[ModuleType] = ModuleType.CONTRIB
 
     action: str
     user_email: str
@@ -320,14 +343,21 @@ class MainAppConfig(AppConfig):
 
 ## Built-in Plugins
 
+Registered via `AMSDAL_CONTRIBS`:
+
 | Plugin | AppConfig | Description |
 |--------|-----------|-------------|
 | Auth | `amsdal.contrib.auth.app.AuthAppConfig` | Authentication & permissions |
 | Frontend Configs | `amsdal.contrib.frontend_configs.app.FrontendConfigAppConfig` | UI field configs |
 | ML | `amsdal_ml.app.MLPluginAppConfig` | Embeddings, vector search, agents, MCP |
-| Mail | `amsdal_mail` | SMTP/SES email |
-| Storages | `amsdal_storages` | S3 object storage |
-| LangGraph | `amsdal_langgraph` | LangGraph checkpoint persistence |
+| Mail | `amsdal_mail.app.MailAppConfig` | SMTP/SES email |
+| LangGraph | `amsdal_langgraph.app.AmsdalLangGraphAppConfig` | LangGraph checkpoint persistence |
+
+**Storages** has **no** AppConfig and is **not** registered via `AMSDAL_CONTRIBS`. It is wired through the `DEFAULT_FILE_STORAGE` setting (which selects the storage backend class):
+
+```bash
+DEFAULT_FILE_STORAGE="amsdal_storages.s3.S3Storage"
+```
 
 ## Complete Plugin Example
 
@@ -346,11 +376,13 @@ class AnalyticsAppConfig(AppConfig):
 
 
 # my_analytics/models/page_view.py
+from typing import ClassVar
+
 from amsdal.models import Model
 from amsdal_utils.models.enums import ModuleType
 
 class PageView(Model):
-    __module_type__ = ModuleType.CONTRIB
+    __module_type__: ClassVar[ModuleType] = ModuleType.CONTRIB
     path: str
     user_email: str | None = None
     timestamp: str

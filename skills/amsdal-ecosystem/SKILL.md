@@ -11,6 +11,21 @@ user-invocable: false
 
 Ready-made plugins that extend AMSDAL applications.
 
+## Before you commit to anything concrete
+
+This skill is a routing index, not a complete or current spec. Before you finalize ANY concrete artifact — a plugin config, an AppConfig path, a setting, an import path, an API call — confirm it against an authoritative source FIRST:
+
+1. `knowledge/` — if it concerns runtime behavior / debugging.
+2. WebFetch the matching `docs.amsdal.com` page (map below) — for API / usage.
+
+Do this by default, NOT only when uncertain — you cannot detect what this skill silently omits.
+
+**Docs map for this skill:**
+- storages (S3, filesystem, DB) → https://docs.amsdal.com/framework/plugins/amsdal-storages/overview/
+- mail (SMTP / SES) → https://docs.amsdal.com/framework/plugins/amsdal-mail/overview/
+- CRM → https://docs.amsdal.com/framework/plugins/amsdal-crm/overview/
+- ML → https://docs.amsdal.com/framework/plugins/amsdal-ml/overview/
+
 ## Quick Reference
 
 | Plugin | Package | AppConfig | Purpose |
@@ -21,7 +36,7 @@ Ready-made plugins that extend AMSDAL applications.
 | CRM | `amsdal-crm` | `amsdal_crm.app.CRMAppConfig` | CRM: entities, deals, pipelines, activities |
 | Mail | `amsdal-mail` | `amsdal_mail.app.MailAppConfig` | Email (SMTP/SES) |
 | Storages | `amsdal_storages` | — (storage backend) | S3 file storage |
-| LangGraph | `amsdal-workflow` | — (direct use) | LangGraph checkpoint persistence |
+| LangGraph | `amsdal-langgraph` | `amsdal_langgraph.app.AmsdalLangGraphAppConfig` | LangGraph checkpoint persistence |
 | Integrations | `amsdal_integrations` | — (standalone SDK) | Cross-ORM integration |
 
 ## Registration
@@ -67,7 +82,7 @@ AMSDAL_CRM_MAX_WORKFLOW_RULES_PER_ENTITY=100
 
 **Sales Pipeline:**
 - `Pipeline` — pipeline definition (name, description, is_active)
-- `Stage` — pipeline stages (name, order, win_probability, status: open/closed_won/closed_lost)
+- `Stage` — pipeline stages (name, order, probability, status: open/closed_won/closed_lost)
 - `Deal` — sales opportunities (name, amount, currency, stage, entity, expected_date, closed_date)
 
 **Activities (Timeline):**
@@ -114,14 +129,17 @@ timeline = await ActivityService.aget_timeline(
 )
 ```
 
-**EmailService** — log emails:
+**EmailService** — log emails (`cc_addresses` is a required positional, pass `None` for none):
 ```python
+from amsdal_crm.models.activity import ActivityRelatedTo
+
 email = await EmailService.alog_email(
     subject='Follow-up',
     body='Hello...',
     from_address='sales@example.com',
     to_addresses=['client@example.com'],
-    related_to_type='Deal',
+    cc_addresses=None,
+    related_to_type=ActivityRelatedTo.DEAL,
     related_to_id='deal-456',
     is_outbound=True,
 )
@@ -234,27 +252,29 @@ AMSDAL_EMAIL_BACKEND=dummy     # no-op
 
 ### Sending Emails
 
+`send_mail`/`asend_mail` take positional args: `(subject, message, from_email, recipient_list, *, html_message=None, fail_silently=False, connection=None, **kwargs)`. The plain-text body is `message`; HTML is passed via `html_message`. Both return a `SendStatus`.
+
 ```python
-from amsdal_mail import send_mail, asend_mail, EmailMessage, Attachment
+from amsdal_mail import send_mail, asend_mail, EmailMessage, Attachment, get_connection
 
-# Simple send
+# Simple send (positional)
 send_mail(
-    subject='Welcome!',
-    body='Hello, welcome to our platform.',
-    from_email='noreply@example.com',
-    to=['user@example.com'],
+    'Welcome!',
+    'Hello, welcome to our platform.',
+    'noreply@example.com',
+    ['user@example.com'],
 )
 
-# Async send
+# Async send with HTML
 await asend_mail(
-    subject='Welcome!',
-    body='<h1>Hello!</h1>',
-    from_email='noreply@example.com',
-    to=['user@example.com'],
-    html=True,
+    'Welcome!',
+    'Hello, welcome to our platform.',
+    'noreply@example.com',
+    ['user@example.com'],
+    html_message='<h1>Hello!</h1>',
 )
 
-# Full EmailMessage
+# Full EmailMessage (body=plain text, html_body=HTML)
 msg = EmailMessage(
     subject='Report',
     body='Please find attached.',
@@ -262,13 +282,15 @@ msg = EmailMessage(
     to=['manager@example.com'],
     cc=['team@example.com'],
     bcc=['archive@example.com'],
+    html_body='<p>Please find attached.</p>',
     attachments=[
         Attachment(filename='report.pdf', content=pdf_bytes, mimetype='application/pdf'),
     ],
     tags=['reports'],
     metadata={'report_id': '123'},
 )
-result = send_mail(msg)
+# send_mail() does NOT accept an EmailMessage — send via a connection
+status = get_connection().send_messages([msg])
 ```
 
 ### Features
@@ -310,9 +332,9 @@ from amsdal.contrib.auth.decorators import permissions, allow_any, require_auth
 | Variable | Description |
 |----------|-------------|
 | `AMSDAL_REQUIRE_DEFAULT_AUTHORIZATION` | Require auth by default (true) |
-| `REQUIRE_MFA_BY_DEFAULT` | Force MFA |
-| `MFA_TOTP_ISSUER` | TOTP app name |
-| `AUTH_TOKEN_EXPIRATION` | Token lifetime (seconds) |
+| `AMSDAL_REQUIRE_MFA_BY_DEFAULT` | Force MFA |
+| `AMSDAL_MFA_TOTP_ISSUER` | TOTP app name |
+| `AMSDAL_AUTH_TOKEN_EXPIRATION` | Token lifetime (seconds) |
 
 ---
 
@@ -328,7 +350,12 @@ Persist LangGraph workflow state in AMSDAL database.
 
 ### Installation
 ```bash
-pip install amsdal-workflow
+pip install amsdal-langgraph
+```
+
+### Registration
+```bash
+AMSDAL_CONTRIBS="...,amsdal_langgraph.app.AmsdalLangGraphAppConfig"
 ```
 
 ### Usage
@@ -390,7 +417,7 @@ pip install amsdal_integrations
 ### Usage
 
 ```python
-from amsdal_integrations import AmsdalIntegration, AsyncAmsdalSdk
+from amsdal_integrations.core import AmsdalIntegration, AsyncAmsdalSdk
 from amsdal_integrations.data_classes import IntegrationConfig, Schema, PropertySchema
 
 # Setup
@@ -406,8 +433,8 @@ integration = AmsdalIntegration(config)
 schema = Schema(
     title='ExternalProduct',
     properties={
-        'name': PropertySchema(type='string'),
-        'price': PropertySchema(type='number'),
+        'name': PropertySchema(type='string', default=''),
+        'price': PropertySchema(type='number', default=0),
     },
     required=['name'],
 )

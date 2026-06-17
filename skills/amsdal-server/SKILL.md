@@ -11,6 +11,22 @@ user-invocable: false
 
 AMSDAL Server is a FastAPI-based REST API server that automatically generates endpoints from AMSDAL models.
 
+## Before you commit to anything concrete
+
+This skill is a routing index, not a complete or current spec. Before you finalize ANY concrete artifact — a route, a request/response shape, an auth/permission rule, a config key, an import path, an API call — confirm it against an authoritative source FIRST:
+
+1. `knowledge/` — if it concerns runtime behavior / debugging.
+2. WebFetch the matching `docs.amsdal.com` page (map below) — for API / usage.
+
+Do this by default, NOT only when uncertain — you cannot detect what this skill silently omits. A construct being valid Python/Pydantic, or seeming obvious, is not evidence that AMSDAL supports it.
+
+**Docs map for this skill:**
+- server overview → https://docs.amsdal.com/server/amsdal-server/
+- REST API usage → https://docs.amsdal.com/server/rest-api-guide/
+- authentication / permissions → https://docs.amsdal.com/server/amsdal-auth/
+- server events → https://docs.amsdal.com/server/server-events/
+- health checks → https://docs.amsdal.com/server/health-checks/
+
 ## REST API Endpoints
 
 ### Objects (CRUD)
@@ -20,7 +36,7 @@ AMSDAL Server is a FastAPI-based REST API server that automatically generates en
 | GET | `/api/objects/?class_name=X` | List objects |
 | GET | `/api/objects/{address}/` | Get single object |
 | POST | `/api/objects/?class_name=X` | Create object |
-| PUT | `/api/objects/{address}/` | Full update |
+| PUT / POST | `/api/objects/{address}/` | Full update (both methods registered) |
 | PATCH | `/api/objects/{address}/` | Partial update |
 | DELETE | `/api/objects/{address}/` | Delete object |
 
@@ -29,7 +45,7 @@ AMSDAL Server is a FastAPI-based REST API server that automatically generates en
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | POST | `/api/objects/bulk-create/?class_name=X` | Bulk create |
-| PUT | `/api/objects/bulk-update/` | Bulk full update |
+| PUT / POST | `/api/objects/bulk-update/` | Bulk full update (both methods registered) |
 | PATCH | `/api/objects/bulk-update/` | Bulk partial update |
 | POST | `/api/objects/bulk-delete/` | Bulk delete |
 
@@ -40,8 +56,10 @@ AMSDAL Server is a FastAPI-based REST API server that automatically generates en
 | GET | `/api/classes/` | List all model classes |
 | GET | `/api/classes/{class_name}/` | Class detail |
 | GET | `/api/transactions/` | List transactions |
+| GET | `/api/transactions/{name}/` | Transaction detail |
 | POST | `/api/transactions/{name}/` | Execute transaction |
 | GET | `/api/objects/file-download/{object_id}/` | Download file |
+| GET | `/api/objects/download-file/?object_id=...` | Download file (alias, `object_id` as query param) |
 | POST | `/api/objects/{address}/validate/?class_name=X` | Validate without saving |
 | GET | `/api/probes/liveness/` | Health check |
 | GET | `/api/probes/readiness/` | Readiness probe |
@@ -78,7 +96,9 @@ Response includes `total` field.
 ?ordering=[last_name,first_name]
 ```
 
-### Additional Parameters
+### Additional Parameters (list endpoint)
+
+These apply to the list endpoint `GET /api/objects/?class_name=X`:
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
@@ -86,6 +106,20 @@ Response includes `total` field.
 | `include_subclasses` | bool | false | Include subclass objects |
 | `load_references` | bool | false | Eagerly load references |
 | `all_versions` | bool | false | All versions |
+| `decrypt_pii` | bool | false | Decrypt PII fields |
+| `select_related` | str | — | Comma-separated relations |
+
+### Object-detail parameters
+
+The single-object endpoint `GET /api/objects/{address}/` supports a reduced set
+(it does **not** accept `include_subclasses`, `load_references`, `page`, `page_size`, or `ordering`):
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `version_id` | str | `''` | Specific version to fetch |
+| `all_versions` | bool | false | Return all versions |
+| `include_metadata` | bool | true | Include metadata |
+| `file_optimized` | bool | false | Optimized handling for file objects |
 | `decrypt_pii` | bool | false | Decrypt PII fields |
 | `select_related` | str | — | Comma-separated relations |
 
@@ -98,7 +132,7 @@ AMSDAL_CONTRIBS="amsdal.contrib.auth.app.AuthAppConfig"
 
 ### Core Auth Models
 
-**User:** `email`, `password` (hash), `permissions` (list[Permission])
+**User:** `email`, `password` (`bytes` — bcrypt hash), `permissions` (`list[Permission] | None`)
 **Permission:** `resource_type` (`models`/`transactions`), `model` (name or `*`), `action` (`create`/`read`/`update`/`delete`/`execute` or `*`)
 **LoginSession:** `email`, `password`, `token` (JWT returned on success), `mfa_code` (optional)
 
@@ -246,9 +280,10 @@ from amsdal_server.apps.common.events.server import (
 3. **RouterSetupEvent** — add custom routes
 4. Standard middleware registered
 5. **MiddlewareSetupEvent** — add custom middleware
-6. **ServerStartupEvent** (async, in lifespan)
-7. Server running...
-8. **ServerShutdownEvent** (async, in lifespan)
+6. **License validation** (async, in lifespan) — `LicenseGuard.ensure_valid()` runs at the start of the lifespan, **before** `ServerStartupEvent`; an invalid license aborts boot
+7. **ServerStartupEvent** (async, in lifespan)
+8. Server running...
+9. **ServerShutdownEvent** (async, in lifespan)
 
 ### Adding Custom Routes
 
@@ -321,7 +356,8 @@ from amsdal_server.apps.common.events.authorize import (
 
 ```python
 from amsdal_server.apps.healthcheck.services.checkers.base import BaseHealthchecker
-from amsdal_server.apps.healthcheck.serializers import HealthcheckServiceResult, StatusEnum
+from amsdal_server.apps.healthcheck.serializers.healthcheck_result import HealthcheckServiceResult
+from amsdal_server.apps.healthcheck.enums import StatusEnum
 
 class RedisHealthchecker(BaseHealthchecker):
     async def check(self) -> HealthcheckServiceResult:

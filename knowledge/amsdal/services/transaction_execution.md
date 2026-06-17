@@ -25,6 +25,20 @@ Step-by-step:
    - `isinstance(decorator, ast.Call) and isinstance(decorator.func, ast.Name) and decorator.func.id in [transaction_name]` — i.e. called decorator like `@transaction(...)`.
 6. Only decorators written as plain names or simple calls to a name are recognized. Attribute-style decorators (e.g. `@module.transaction`) are NOT detected.
 
+### `is_hidden_transaction(statement: ast.AST) -> bool`
+
+Returns `True` only when a transaction decorator is invoked with the keyword `hidden=True` written as a literal boolean `True`. Designed to be resolvable statically from source (no import needed).
+
+Step-by-step:
+1. Sets local `transaction_name = 'transaction'`; if `AmsdalConfigManager().get_config().async_mode` is truthy → reassigns to `'async_transaction'` (same async-mode dependency as `is_transaction`).
+2. If `statement` is not an `ast.AsyncFunctionDef` or `ast.FunctionDef` → returns `False`.
+3. Iterates `statement.decorator_list`:
+   - `continue` (skip) any decorator that is NOT a call form (`ast.Call`) with `ast.Name` func whose `id == transaction_name`. Bare `@transaction` (no call) is ignored here.
+   - For each matching call decorator, iterates `decorator.keywords`; if a keyword has `kw.arg == 'hidden'` AND `kw.value` is an `ast.Constant` AND `kw.value.value is True` → returns `True`.
+4. If no such keyword found across all decorators → returns `False`.
+
+Edge cases: only the literal `True` constant matches. `hidden=1`, `hidden=<variable>`, or any non-`ast.Constant` value does not match.
+
 ### `annotation_is_model(annotation: Any) -> bool`
 
 Determines whether a type annotation represents an AMSDAL `Model` subclass (optionally wrapped in a Union/Optional).
@@ -78,7 +92,7 @@ Step-by-step:
 
 Asynchronous execution entry point. Nearly identical to `execute_transaction` with two differences:
 
-1. **Reference branch behavior**: instead of `ReferenceLoader(Reference(**value)).load_reference()`, assigns `args_copy[field_name] = await Reference(**value)`. **This is suspicious / likely buggy**: `Reference(**value)` constructs a pydantic-style `Reference` object, and `await`-ing a non-awaitable raises `TypeError`. The surrounding `suppress(Exception)` swallows this silently, so the field will remain an unresolved `{'ref': {...}}` dict when it reaches the transaction function. Debuggers seeing unresolved references in async transactions should suspect this branch.
+1. **Reference branch behavior**: instead of `ReferenceLoader(Reference(**value)).load_reference()`, assigns `args_copy[field_name] = await Reference(**value)`. `Reference` is awaitable (it defines `__await__`, which delegates to `self.aload().__await__()`), so awaiting it asynchronously resolves the reference into the loaded model instance. This is the async counterpart of the sync branch's `ReferenceLoader(...).load_reference()`. If resolution raises, the surrounding `suppress(Exception)` swallows it and the field remains the raw `{'ref': {...}}` dict.
 2. **Execution branch**:
    - If `asyncio.iscoroutinefunction(transaction_func)` → `transaction_result = await transaction_func(**args_copy)`.
    - Else → `transaction_result = transaction_func(**args_copy)` (called synchronously within the async context — blocking).
@@ -107,7 +121,7 @@ Will raise `RuntimeError` if called when a loop is already running in the curren
 Scans for, imports, and returns the named transaction function.
 
 Step-by-step:
-1. Iterates `self._get_transaction_definitions()` — yielding `(definition, file_path)` tuples where `definition` is an `ast.FunctionDef`/`ast.AsyncFunctionDef` and `file_path` is a `pathlib.Path`.
+1. Iterates `self.iter_transaction_definitions()` — yielding `(definition, file_path)` tuples where `definition` is an `ast.FunctionDef`/`ast.AsyncFunctionDef` and `file_path` is a `pathlib.Path`.
 2. Skips entries where `definition.name != transaction_name`.
 3. On match:
    - Constructs `loader = SourceFileLoader(file_path.stem, str(file_path.absolute()))` — loader name is the file's stem (filename without extension).
@@ -117,7 +131,7 @@ Step-by-step:
    - Does NOT insert into `self._transactions`. The module is not inserted into `sys.modules`, so subsequent loads of the same file create a brand-new module object and a brand-new function.
 4. If the loop exhausts without matches → raises `TransactionNotFoundError(f'Transaction {transaction_name} not found')`.
 
-### `_get_transaction_definitions(cls) -> Generator[tuple[ast.FunctionDef | ast.AsyncFunctionDef, Path], None, None]` (classmethod)
+### `iter_transaction_definitions(cls) -> Generator[tuple[ast.FunctionDef | ast.AsyncFunctionDef, Path], None, None]` (classmethod)
 
 Enumerates all transaction functions across the main transactions path and contrib packages.
 
@@ -157,10 +171,10 @@ Because `ast.walk` traverses the entire tree, nested transaction-decorated funct
 
 ## Key behaviors and pitfalls for debugging
 
-- **Async-mode decorator name depends on global config**: if `AmsdalConfigManager().get_config().async_mode` is `True`, only `@async_transaction`-decorated functions are discovered; if `False`, only `@transaction`. Switching modes without updating decorators makes transactions "disappear" from `_get_transaction_definitions`.
+- **Async-mode decorator name depends on global config**: if `AmsdalConfigManager().get_config().async_mode` is `True`, only `@async_transaction`-decorated functions are discovered; if `False`, only `@transaction`. Switching modes without updating decorators makes transactions "disappear" from `iter_transaction_definitions`.
 - **Cache never populated**: every call to `get_transaction_func` triggers a full filesystem scan plus `exec_module` of the matching file. Module top-level side effects execute repeatedly.
 - **Preprocessing errors silently swallowed**: the `suppress(Exception)` block around argument preprocessing means failures in `Reference(**value)` construction, `ReferenceLoader.load_reference()`, or `File(**value)` are invisible — the transaction receives the raw dict instead of the resolved object.
-- **Async reference branch broken**: `await Reference(**value)` in `async_execute_transaction` awaits a non-awaitable; caught by `suppress`, leaving the field unresolved.
+- **Async reference branch**: `await Reference(**value)` in `async_execute_transaction` resolves the reference asynchronously (`Reference.__await__` → `aload()`); this is the correct async equivalent of the sync `ReferenceLoader(...).load_reference()`. Only on a resolution error (swallowed by `suppress`) does the field remain unresolved.
 - **Error logging**: on execution failure, logs at `ERROR` level with message `'Failed to execute transaction=%s, args=%s'`, includes full traceback via `exc_info=True`, then re-raises the original exception.
 - **Decorator detection is syntactic**: only works for `@transaction` or `@transaction(...)` written as bare names — `@amsdal.transaction` or `@aliased_decorator` will not be detected.
 - **Contrib path parsing**: `contrib_config.rsplit('.', 2)[0]` assumes a dotted config path with at least two dots — e.g. `pkg.app.AppConfig` → `pkg`. Shorter paths yield the full string, which may not be the intended package.

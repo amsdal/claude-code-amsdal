@@ -17,7 +17,7 @@ Module-level `logger = logging.getLogger(__name__)`.
 
 ## `AmsdalTransactionManager`
 
-**Metaclass:** `Singleton` (from `amsdal_utils.utils.singleton`) — only one instance per process.
+**Metaclass:** none (plain class — the source declares `class AmsdalTransactionManager:` with no metaclass and no base). A single shared instance is obtained elsewhere via the data application, but this class does NOT enforce singleton-ness itself.
 
 **Purpose:** Synchronous transaction manager. Begin/commit/rollback lifecycle, supports nesting, persists root transaction record to the lakehouse on commit.
 
@@ -27,11 +27,11 @@ Module-level `logger = logging.getLogger(__name__)`.
 |---|---|---|---|
 | `context` | `TransactionContext \| None` | `None` | Currently active (innermost) context. Linked list via `.parent`. |
 | `transaction_object` | `Transaction \| None` | `None` | Root-level `Transaction` record, created on outermost `begin()`. Cleared after outermost commit. |
-| `operation_manager` | (from `DataApplication`) | `DataApplication().operation_manager` | Delegate for transaction and data commands. |
+| `operation_manager` | (from data application) | `get_data_application().operation_manager` | Delegate for transaction and data commands. Captured once at construction. |
 
-**Thread safety:** Uses plain instance attributes. Since the class is a singleton, state is shared across all threads — **NOT thread-safe**. Use `AmsdalAsyncTransactionManager` (ContextVar-backed) for concurrent use.
+**Thread safety:** Uses plain instance attributes (`self.context`, `self.transaction_object`). When a single shared instance is used, state is shared across all threads/coroutines — **NOT isolated**. Use `AmsdalAsyncTransactionManager` (ContextVar-backed) for concurrent async use.
 
-**`__init__`:** Lazily imports `DataApplication` from `amsdal_data.application` (avoids circular imports). Sets `self.context = None`, `self.transaction_object = None`, assigns `self.operation_manager`.
+**`__init__`:** Lazily imports `get_data_application` from `amsdal_data.contexts` (deferred import inside the method to avoid circular imports). Sets `self.context = None`, `self.transaction_object = None`, then `self.operation_manager = get_data_application().operation_manager`.
 
 ### Property: `transaction_id` → `str | None`
 
@@ -129,9 +129,9 @@ Walks the context chain up to the root.
 
 ## `AmsdalAsyncTransactionManager`
 
-**Metaclass:** `Singleton`.
+**Metaclass:** none (plain class — `class AmsdalAsyncTransactionManager:`, no metaclass, no base).
 
-**Purpose:** Async-safe transaction manager. Identical logic to the sync variant, but all glue commands are `await`ed and state is stored in `ContextVar`s instead of instance attributes — safe for concurrent async tasks.
+**Purpose:** Async-safe transaction manager. Identical logic to the sync variant, but the two operation-manager calls (and `_store_transaction`) are `await`ed and state is stored in module-level `ContextVar`s instead of instance attributes — isolated per async context/task.
 
 ### State
 
@@ -139,9 +139,9 @@ Walks the context chain up to the root.
 |---|---|---|
 | `context` | `ASYNC_TRANSACTION_CONTEXT` ContextVar | Per-task context. Accessed via property. |
 | `transaction_object` | `ASYNC_TRANSACTION_OBJECT` ContextVar | Per-task root transaction. Accessed via property. |
-| `operation_manager` | Instance attribute | Async operation manager from `AsyncDataApplication`. |
+| `operation_manager` | Instance attribute | Async operation manager from `get_data_application().operation_manager`. |
 
-**`__init__`:** Lazily imports `AsyncDataApplication`, assigns `self.operation_manager`. Does NOT initialize `context` or `transaction_object` as instance attributes — those are properties backed by ContextVars.
+**`__init__`:** Lazily imports `get_data_application` from `amsdal_data.contexts` (same import as the sync class), then assigns `self.operation_manager = get_data_application().operation_manager`. Does NOT initialize `context` or `transaction_object` as instance attributes — those are properties backed by ContextVars (default `None`).
 
 ### Properties
 
@@ -162,7 +162,7 @@ Synchronous. Reads current context from the ContextVar, walks the parent chain. 
 
 ## Key behavioral notes for debugging
 
-1. **Singleton + ContextVar split:** `AmsdalTransactionManager` uses instance attributes (shared across threads — not thread-safe). `AmsdalAsyncTransactionManager` uses ContextVars (per-task — safe for concurrent coroutines). Don't mix.
+1. **Instance-attribute vs ContextVar split:** `AmsdalTransactionManager` uses instance attributes (state shared across threads/coroutines on a shared instance — not isolated). `AmsdalAsyncTransactionManager` uses ContextVars (per async context — isolated for concurrent coroutines). Neither class declares a `Singleton` metaclass. Don't mix the two managers.
 
 2. **Commit failure reverts the parent, not the child:** In `commit()`, by the time failure handling runs, `self.context` already points to the parent. The REVERT command targets the parent. If parent is top-level or None → NO revert is issued (only the exception is raised). This is explicitly marked as TODO in the code.
 
@@ -190,7 +190,7 @@ Synchronous. Reads current context from the ContextVar, walks the parent chain. 
 | Module | Usage |
 |---|---|
 | `amsdal_glue` | All transaction lifecycle (BEGIN/COMMIT/ROLLBACK/REVERT) and data persistence (InsertData) go through glue. |
-| `amsdal_data.application.DataApplication` / `AsyncDataApplication` | Lazily imported inside `__init__` to avoid circular imports. Provides `operation_manager`. |
+| `amsdal_data.contexts.get_data_application` | Lazily imported inside `__init__` (both classes) to avoid circular imports. Returns the data application (`DataApplication` or `AsyncDataApplication`) whose `.operation_manager` is captured. |
 | `amsdal_utils.models.data_models.transaction.Transaction` | Pydantic model for the transaction record. Created on root begin, serialized and stored on root commit. |
 | `amsdal_data.data_models.transaction_context.TransactionContext` | Carries per-transaction metadata (address, parent link, return value, `is_top_level` flag). Forms a linked list for nesting. |
 | `amsdal_data.connections.constants.PRIMARY_PARTITION_KEY` | Partition key field name when storing the transaction record. |

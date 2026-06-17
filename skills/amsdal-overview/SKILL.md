@@ -13,6 +13,29 @@ user-invocable: false
 
 AMSDAL is a Python SDK/framework for building data-driven applications: REST APIs, ETL pipelines, AI workflows. It provides models with versioning, automatic REST endpoints, multi-database support, and a plugin ecosystem.
 
+## Source-of-truth precedence (when sources disagree)
+
+1. `knowledge/` (this plugin) — generated from compiled source; ground truth for behavior, bugs, edge cases. Highest trust.
+2. `docs.amsdal.com` (WebFetch) — authoritative for API / usage (field types, CLI, signatures).
+3. This skill's prose — curated quick-reference, may drift. Lowest trust.
+
+Use `knowledge/` for "why does it behave this way / debugging", docs for "how do I use X / what's supported", this skill to orient and route to those.
+
+## Before you commit to anything concrete
+
+This skill is a routing index, not a complete or current spec. Before you finalize ANY concrete artifact — a model or field definition, a transaction or function signature, a CLI command or flag, a server route, a config key, an import path, an API call — confirm it against an authoritative source FIRST:
+
+1. `knowledge/` — if it concerns runtime behavior / debugging.
+2. WebFetch the matching `docs.amsdal.com` page (map below) — for API / usage.
+
+Do this by default, NOT only when uncertain — you cannot detect what this skill silently omits. A construct being valid Python/Pydantic, or seeming obvious, is not evidence that AMSDAL supports it.
+
+**Docs map for this skill:**
+- creating / scaffolding a new app, CLI → https://docs.amsdal.com/cli/overview/
+- installation → https://docs.amsdal.com/get-started/installation/
+- config.yml / connections → https://docs.amsdal.com/models/configuration/
+- framework concepts / overview → https://docs.amsdal.com/models/background/
+
 ## Core Packages & Architecture
 
 ```
@@ -56,6 +79,9 @@ Middleware-chain pattern: `Event → Listener 1 → Listener 2 → ... → Resul
 ### Singleton Managers
 Core services accessed via `Container.managers.get(ManagerClass)` and `Container.services.get(ServiceClass)`.
 
+### License Validation
+On manager setup, AMSDAL runs a one-time license check per process: `authenticate()` calls `LicenseGuard.ensure_valid()` (`amsdal/manager.py:321-323` sync, `:723-725` async). This happens during app/server bootstrap; an invalid license aborts startup. No action needed for normal development — just be aware boot can fail on license errors.
+
 ### Async-First
 All ORM methods have sync/async variants: `save()`/`asave()`, `execute()`/`aexecute()`, etc.
 
@@ -66,7 +92,17 @@ All ORM methods have sync/async variants: `save()`/`asave()`, `execute()`/`aexec
 
 ## Creating an AMSDAL App from Scratch
 
-You do NOT need the `amsdal` CLI to create models, transactions, or app files — just create them manually in the right locations. The CLI is primarily used for running the local server (`amsdal serve`), managing migrations (`amsdal migrations`), and cloud operations.
+**A new app MUST be created with `amsdal new <APP_NAME> <OUTPUT_PATH>` — never hand-assembled.** The command generates things you cannot reliably recreate by hand: the app's UUID, the full project tree, `config.yml`, a `.env` pre-populated with a placeholder PII crypto service, and the `requirements*.txt` files. Hand-creating the project skips these and produces a subtly broken app.
+
+```bash
+amsdal new MyApp ~/projects/     # scaffold the whole project — do this first
+```
+
+Confirm the exact command and what it generates by WebFetching https://docs.amsdal.com/cli/overview/ before scaffolding.
+
+Once the app exists, you may add **models and transactions** by hand in the right locations (`src/models/`, `src/transactions/`) — those are just Python files and do not need the CLI. `amsdal generate model/transaction/tests` is also available if you prefer scaffolding them (see https://docs.amsdal.com/cli/overview/).
+
+The structure below is a reference for *what `amsdal new` produces*, not a manual build recipe.
 
 ### Project Structure
 
@@ -96,6 +132,10 @@ my_app/
 └── requirements-dev.txt     # Dev-only dependencies (not deployed)
 ```
 
+> **Every package under `src/` (`models/`, `transactions/`, `tests/`, and any subpackage) MUST contain an `__init__.py`.** Without it the directory becomes a namespace package whose `__file__` is `None`, and `amsdal migrations new` crashes in the class loader with `TypeError: ... not 'NoneType'` (from `Path(None)`). `amsdal new` creates these for you — if you add a package by hand, add the `__init__.py`.
+
+> The steps below describe the files `amsdal new` already generated — read them to understand and **customize** the scaffold (pick DB backends, set connections, add secrets), not to create the project from scratch.
+
 ### Step 1: requirements.txt
 
 **Important:** `requirements.txt` is used during cloud deployment. Only include production dependencies here.
@@ -105,12 +145,12 @@ my_app/
 **Recommended default** — include both `async-sqlite` and `postgres-binary` so the app works locally (SQLite) and is ready for AMSDAL Cloud deploy (PostgreSQL) without changes:
 
 ```
-amsdal[server,cli]>=0.8.0
+amsdal[server,cli]>=0.9.0
 amsdal-glue-connections[async-sqlite,postgres-binary]
 # For optimized production deploy, replace postgres-binary with postgres-c:
 # amsdal-glue-connections[async-sqlite,postgres-c]
-# postgres-c uses psycopg2 (C-based) — better performance but requires libpq-dev on the system.
-# postgres-binary uses psycopg2-binary — works out of the box, fine for dev and cloud deploy.
+# postgres-c uses psycopg[c] (psycopg3, C-based) — better performance but requires libpq-dev on the system.
+# postgres-binary uses psycopg[binary] (psycopg3) — works out of the box, fine for dev and cloud deploy.
 ```
 
 **Always use this combined form for new projects.** Even if the user only uses SQLite locally, AMSDAL Cloud runs PostgreSQL, so having `postgres-binary` in requirements.txt prevents deploy failures.
@@ -125,7 +165,7 @@ amsdal-glue-connections[async-sqlite,postgres-binary]
 
 Add plugin packages as needed:
 ```
-amsdal[server,cli]>=0.8.0
+amsdal[server,cli]>=0.9.0
 amsdal-glue-connections[async-sqlite,postgres-binary]
 amsdal-ml>=0.1.0
 amsdal-crm>=0.1.0
@@ -199,12 +239,12 @@ connections:
   - name: lakehouse
     backend: postgres-historical-async
     credentials:
-      - dsn: postgresql+asyncpg://user:password@localhost:5432/myapp_lakehouse
+      - dsn: postgresql://user:password@localhost:5432/myapp_lakehouse
 
   - name: state
     backend: postgres-state-async
     credentials:
-      - dsn: postgresql+asyncpg://user:password@localhost:5432/myapp_state
+      - dsn: postgresql://user:password@localhost:5432/myapp_state
 
 resources_config:
   lakehouse: lakehouse
@@ -250,7 +290,7 @@ AMSDAL_CONTRIBS="amsdal.contrib.auth.app.AuthAppConfig,amsdal.contrib.frontend_c
 ```
 
 **IMPORTANT: `AMSDAL_REQUIRE_DEFAULT_AUTHORIZATION` controls the default permission mode:**
-- **`True` (recommended)** — all endpoints require authentication by default. Use `@permissions(read=AllowAny)` on models and `@allow_any` on transactions that should be public. This is the secure default.
+- **`True` (recommended)** — all endpoints require authentication by default. Use `@permissions(read=AllowAny)` on models and `@allow_any` on transactions that should be public. `@require_auth` is the shorthand alias for `@permissions(RequireAuth)`, and `@allow_any` for `@permissions(AllowAny)`. This is the secure default.
 - **`False`** — all endpoints are public by default. Only use this if the app has no auth at all.
 
 **If the user asks for authentication/authorization, ALWAYS set `AMSDAL_REQUIRE_DEFAULT_AUTHORIZATION=True`.** Then selectively open public endpoints with `@permissions` or `@allow_any`. Never set it to `False` when auth is needed — that defeats the purpose.
@@ -388,6 +428,8 @@ amsdal serve                       # Start server at http://localhost:8080
 
 **Before installing packages:** Always check if a virtual environment is already active (`which python` or `echo $VIRTUAL_ENV`). If not, create one or ask the user which environment to use.
 
+> **`amsdal serve` requires AMSDAL credentials** — without them it launches an interactive sign-up prompt that hangs an agent's shell. Don't run it unless `AMSDAL_ACCESS_KEY_ID` / `AMSDAL_SECRET_ACCESS_KEY` are set (env or `.env`); otherwise stop and ask the user to provide them or run the auth flow themselves. `migrations` / `build` / `tests` need no credentials. See [[amsdal-deploy]] → "Credentials & commands that require them".
+
 ### .amsdal-cli (Optional)
 
 ```json
@@ -395,7 +437,7 @@ amsdal serve                       # Start server at http://localhost:8080
   "config_path": "./config.yml",
   "http_port": 8080,
   "check_model_exists": true,
-  "json_indent": 4
+  "indent": 4
 }
 ```
 
@@ -408,7 +450,7 @@ amsdal migrations new              # Generate migrations
 amsdal migrations apply            # Apply migrations
 amsdal migrations                  # List migrations
 amsdal verify --building           # Verify syntax + building
-amsdal tests run                   # Run tests
+amsdal tests                       # Run tests (alias: amsdal test)
 ```
 
 ---
@@ -451,8 +493,8 @@ hatch run lock         # Update lock file
 
 ### Key Imports & Constants
 ```python
-from amsdal_data.connections.constants import DEFAULT_DB_ALIAS, LAKEHOUSE_DB_ALIAS
-from amsdal.configs.main import AmsdalConfigManager
+from amsdal_data.aliases.using import DEFAULT_DB_ALIAS, LAKEHOUSE_DB_ALIAS
+from amsdal_utils.config.manager import AmsdalConfigManager  # also: from amsdal import AmsdalConfigManager
 from amsdal.context.manager import AmsdalContextManager
 from amsdal.models import Model, ReferenceField, ManyReferenceField
 from amsdal_models import PIIStr
@@ -460,6 +502,10 @@ from amsdal.queryset import Q
 from amsdal.transactions import transaction, async_transaction
 from amsdal_utils.models.enums import ModuleType
 from amsdal_utils.events import EventBus, EventListener, listen_to, Event, EventContext
+
+# Auth decorators & permissions (contrib auth)
+from amsdal.contrib.auth.decorators import permissions, require_auth, allow_any
+from amsdal.contrib.auth.permissions import RequireAuth, AllowAny, RequirePermissions
 ```
 
 ## Common Mistakes to Avoid

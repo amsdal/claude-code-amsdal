@@ -186,6 +186,7 @@ class CacheWarmupListener(EventListener[ServerStartupContext]):
 
 ```python
 from amsdal_utils.events import EventListener, listen_to
+from amsdal_server.apps.common.serializers.column_response import ColumnInfo
 from amsdal_server.apps.objects.events.pre_response import (
     ObjectListPreResponseEvent,
     ObjectListPreResponseContext,
@@ -198,9 +199,11 @@ class EnrichOrderListListener(EventListener[ObjectListPreResponseContext]):
         if context.class_name != 'Order':
             return await next_fn(context)
 
-        # Add computed column to response
+        # Add computed column to response. `columns` holds ColumnInfo models
+        # (fields: type, key, label, ...), not raw dicts.
+        new_column = ColumnInfo(type='str', key='total_display', label='Total')
         enriched_response = context.response.model_copy(
-            update={'columns': context.response.columns + [{'name': 'total_display', 'type': 'str'}]}
+            update={'columns': [*context.response.columns, new_column]}
         )
         context = context.create_next(
             listener_id=self.listener_id,
@@ -216,7 +219,8 @@ class EnrichOrderListListener(EventListener[ObjectListPreResponseContext]):
 
 ```python
 from amsdal_server.apps.healthcheck.services.checkers.base import BaseHealthchecker
-from amsdal_server.apps.healthcheck.serializers import HealthcheckServiceResult, StatusEnum
+from amsdal_server.apps.healthcheck.serializers.healthcheck_result import HealthcheckServiceResult
+from amsdal_server.apps.healthcheck.enums import StatusEnum
 
 
 class ExternalAPIHealthchecker(BaseHealthchecker):
@@ -291,8 +295,11 @@ curl -X POST "http://localhost:8080/api/objects/?class_name=LoginSession" \
 curl "http://localhost:8080/api/objects/?class_name=Customer&decrypt_pii=true" \
   -H "Authorization: Bearer $TOKEN"
 
-# File download
+# File download (path-param form)
 curl "http://localhost:8080/api/objects/file-download/{file_object_id}/?disposition_type=inline"
+
+# File download (alias — object_id passed as a query param)
+curl "http://localhost:8080/api/objects/download-file/?object_id={file_object_id}&disposition_type=inline"
 
 # Health check
 curl "http://localhost:8080/api/probes/liveness/"

@@ -100,7 +100,7 @@ page2 = Person.objects.all()[10:20].execute()
 # Select specific fields only
 names = Person.objects.only(['first_name', 'last_name']).execute()
 
-# Eager-load relations
+# Eager-load forward FK relations (SQL JOIN)
 people = Person.objects.select_related('company').all().execute()
 for p in people:
     print(p.company.name)  # no extra query
@@ -159,6 +159,56 @@ result = Person.objects.filter(
 
 # NOT
 result = Person.objects.filter(~Q(is_active=False)).execute()
+```
+
+## prefetch_related (Reverse-FK, M2M, Nested)
+
+```python
+from amsdal_models.querysets.prefetch import Prefetch
+
+
+# Reverse-FK accessor: Book.author FK exposes author.book_set
+authors = Author.objects.prefetch_related('book_set').execute()
+for author in authors:
+    for book in author.book_set:        # already loaded, no per-author query
+        print(book.title)
+
+# Forward FK batched as a separate query
+users = User.objects.prefetch_related('profile').execute()
+
+# M2M field
+posts = Post.objects.prefetch_related('tags').execute()
+for post in posts:
+    print([tag.name for tag in post.tags])
+
+# Nested relationship chain via dotted lookup
+authors = Author.objects.prefetch_related('book_set__publisher').execute()
+
+# Custom queryset on the target (filter / order_by / only allowed)
+authors = Author.objects.prefetch_related(
+    Prefetch('book_set', queryset=Book.objects.filter(title__icontains='guide').order_by('title')),
+).execute()
+
+# Nested via a prefetching custom queryset
+authors = Author.objects.prefetch_related(
+    Prefetch('books_with_publisher', queryset=BookWithPublisher.objects.prefetch_related('publisher')),
+).execute()
+
+# to_attr: results land as a plain list on instance.__dict__, NOT the relationship cache
+authors = Author.objects.prefetch_related(
+    Prefetch('book_set', queryset=Book.objects.all(), to_attr='collected_books'),
+).execute()
+for author in authors:
+    print(author.collected_books)       # plain list[Book]; author.book_set untouched
+
+# M2M with a custom queryset: target the through-model (Post.tags_through), NOT Tag
+posts = Post.objects.prefetch_related(
+    Prefetch('tags', queryset=Post.tags_through.objects.select_related('tags').filter(...)),
+).execute()
+# Passing Tag.objects.filter(...) here raises AmsdalQuerySetError.
+
+# Async
+authors = await Author.objects.prefetch_related('book_set').aexecute()
 ```
 
 ## Transactions
